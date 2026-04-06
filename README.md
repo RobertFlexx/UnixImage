@@ -1,10 +1,13 @@
 # UnixImage, portable by standard. Break a leg!
 
 > Universal disk image writer for (most) Unix and Unix-like operating systems.
+
 > Some random stupid thing i made because these operating systems have no gui ISO image writing software.
+
 > Youre welcome.
 
 > Disclaimer: Linux, and FreeBSD tested. Others may not work, or may not work reliably.
+
 > Heads up: AI was used in this project (a light amount) as a productivity tool, rather than being the          author itself. Making this known due to the uprising of AI slop, which you dont have to worry here.
 
 ## Supported Systems
