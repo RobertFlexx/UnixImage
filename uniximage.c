@@ -80,7 +80,7 @@
 #include <sys/diskio.h>
 #endif
 
-#define VERSION "2.0"
+#define VERSION "2.1"
 #define PROGRAM_NAME "UnixImage"
 #define MAX_DEVICES 64
 #define MAX_PATH_LEN 4096
@@ -180,6 +180,11 @@ typedef enum {
     PARTscheme_GPT
 } partition_scheme_t;
 
+typedef enum {
+    WRITE_MODE_RAW,
+    WRITE_MODE_WINDOWS
+} write_mode_t;
+
 typedef struct {
     write_state_t state;
     uint64_t bytes_written;
@@ -196,6 +201,14 @@ typedef struct {
     size_t block_size;
     partition_scheme_t partition_scheme;
     int make_bootable;
+    write_mode_t mode;
+    char win_iso_path[MAX_PATH_LEN];
+    char win_usb_device[MAX_PATH_LEN];
+    char win_efi_mount[MAX_PATH_LEN];
+    char win_ntfs_mount[MAX_PATH_LEN];
+    char win_loop_dev[MAX_PATH_LEN];
+    uint64_t files_copied;
+    uint64_t files_total;
 } write_context_t;
 
 typedef struct {
@@ -546,30 +559,653 @@ int is_compressed_image(image_type_t type) {
 int is_windows_image(const char *image_path) {
     int fd = open(image_path, O_RDONLY);
     if (fd < 0) return 0;
-    
+
     char buf[65536];
     ssize_t n = read(fd, buf, sizeof(buf));
     close(fd);
-    
+
     if (n < 512) return 0;
-    
+
     if (strstr(buf, "sources/boot.wim") || strstr(buf, "sources/install.wim") ||
         strstr(buf, "sources/bootx64.wim") || strstr(buf, "sources/installx64.wim") ||
         strstr(buf, "\\sources\\boot.wim") || strstr(buf, "\\sources\\install.wim")) {
         return 2;
     }
-    
+
     if (strstr(buf, "efi/microsoft") || strstr(buf, "EFI/Microsoft")) {
         return 3;
     }
-    
-    if (memmem(buf, n, "Microsoft Corporation", 21) && 
+
+    if (memmem(buf, n, "Microsoft Corporation", 21) &&
         (memmem(buf, n, "Windows", 7) || memmem(buf, n, "BOOT", 4))) {
         return 1;
     }
-    
+
     return 0;
 }
+
+#if defined(__linux__)
+static uint64_t get_device_size(const char *path);
+static int unmount_device(const char *device);
+
+static int check_tool(const char *tool) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "which %s 2>/dev/null", tool);
+    return system(cmd) == 0;
+}
+
+static int check_required_tools(void) {
+    if (!check_tool("mkfs.vfat")) {
+        log_message("WARNING", "Missing tool: mkfs.vfat");
+    }
+    if (!check_tool("mount")) {
+        log_message("WARNING", "Missing tool: mount");
+    }
+    if (!check_tool("losetup")) {
+        log_message("WARNING", "Missing tool: losetup");
+    }
+    return 0;
+}
+
+static int get_wim_size(const char *iso_mount, uint64_t *size) {
+    char wim_path[MAX_PATH_LEN];
+    struct stat st;
+
+    snprintf(wim_path, sizeof(wim_path), "%s/sources/install.wim", iso_mount);
+    if (stat(wim_path, &st) == 0) {
+        *size = (uint64_t)st.st_size;
+        return 0;
+    }
+
+    snprintf(wim_path, sizeof(wim_path), "%s/sources/boot.wim", iso_mount);
+    if (stat(wim_path, &st) == 0) {
+        *size = (uint64_t)st.st_size;
+        return 0;
+    }
+
+    return -1;
+}
+
+static int wipe_device_linux(const char *device) {
+    log_message("INFO", "Wiping device: %s", device);
+
+    int fd = open(device, O_WRONLY);
+    if (fd < 0) {
+        log_message("ERROR", "Cannot open device for wiping: %s", strerror(errno));
+        return -1;
+    }
+
+    unsigned char zeros[512];
+    memset(zeros, 0, sizeof(zeros));
+    lseek(fd, 0, SEEK_SET);
+    write(fd, zeros, sizeof(zeros));
+
+    lseek(fd, 512, SEEK_SET);
+    write(fd, zeros, sizeof(zeros));
+
+    uint64_t dev_size = get_device_size(device);
+    if (dev_size > (8ULL * 1024 * 1024 * 1024)) {
+        lseek(fd, 0, SEEK_END);
+        write(fd, zeros, sizeof(zeros));
+    }
+
+    fsync(fd);
+    close(fd);
+    sync();
+
+    log_message("INFO", "Device wiped successfully");
+    return 0;
+}
+
+static int create_partitions_gpt(const char *device, uint64_t device_size) {
+    log_message("INFO", "Creating GPT partition table on %s", device);
+
+    char cmd[2048];
+    int ret;
+
+    snprintf(cmd, sizeof(cmd),
+        "parted -s %s mklabel gpt 2>&1", device);
+    ret = system(cmd);
+    if (ret != 0) {
+        log_message("ERROR", "Failed to create GPT label: %d", ret);
+    }
+
+    usleep(500000);
+
+    uint64_t efi_size = 512ULL * 1024 * 1024;
+    if (device_size < (4ULL * 1024 * 1024 * 1024)) {
+        efi_size = 256ULL * 1024 * 1024;
+    }
+
+    uint64_t efi_start = 2048;
+    uint64_t efi_end = (efi_size / 512) - 2048;
+    uint64_t ntfs_start = efi_end + 1;
+    uint64_t ntfs_end = (device_size / 512) - 2048;
+
+    snprintf(cmd, sizeof(cmd),
+        "parted -s %s mkpart ESP fat32 %luk %luk 2>&1",
+        device, (unsigned long)(efi_start / 2048), (unsigned long)(efi_end / 2048));
+    ret = system(cmd);
+    if (ret != 0) {
+        log_message("ERROR", "Failed to create EFI partition");
+    }
+
+    usleep(200000);
+
+    snprintf(cmd, sizeof(cmd),
+        "parted -s %s mkpart Windows ntfs %luk %luk 2>&1",
+        device, (unsigned long)(ntfs_start / 2048), (unsigned long)(ntfs_end / 2048));
+    ret = system(cmd);
+    if (ret != 0) {
+        log_message("ERROR", "Failed to create NTFS partition");
+    }
+
+    usleep(500000);
+
+    snprintf(cmd, sizeof(cmd),
+        "parted -s %s set 1 boot on 2>&1", device);
+    system(cmd);
+
+    snprintf(cmd, sizeof(cmd),
+        "parted -s %s set 1 esp on 2>&1", device);
+    system(cmd);
+
+    sync();
+    log_message("INFO", "GPT partitions created successfully");
+    return 0;
+}
+
+static int format_partition(const char *partition, const char *fs_type, const char *label) {
+    log_message("INFO", "Formatting %s as %s (label: %s)", partition, fs_type, label);
+
+    char cmd[1024];
+
+    if (strcmp(fs_type, "fat32") == 0 || strcmp(fs_type, "vfat") == 0) {
+        snprintf(cmd, sizeof(cmd),
+            "mkfs.vfat -F 32 -n %s %s 2>&1", label, partition);
+    } else if (strcmp(fs_type, "ntfs") == 0) {
+        snprintf(cmd, sizeof(cmd),
+            "mkfs.ntfs -f -L %s %s 2>&1", label, partition);
+    } else {
+        log_message("ERROR", "Unsupported filesystem: %s", fs_type);
+        return -1;
+    }
+
+    int ret = system(cmd);
+    if (ret != 0) {
+        log_message("ERROR", "Formatting failed: %d", ret);
+        return -1;
+    }
+
+    sync();
+    usleep(1000000);
+    log_message("INFO", "Partition formatted successfully");
+    return 0;
+}
+
+static int mount_iso_linux(const char *iso_path, char *loop_dev, char *mount_point) {
+    log_message("INFO", "Mounting ISO: %s", iso_path);
+
+    char cmd[1024];
+
+    snprintf(cmd, sizeof(cmd), "losetup -f --show %s 2>&1", iso_path);
+    FILE *p = popen(cmd, "r");
+    if (!p) {
+        log_message("ERROR", "Failed to create loop device");
+        return -1;
+    }
+
+    char dev_path[256];
+    if (fgets(dev_path, sizeof(dev_path), p)) {
+        dev_path[strcspn(dev_path, "\n")] = '\0';
+    }
+    pclose(p);
+
+    if (strlen(dev_path) == 0 || strstr(dev_path, "/dev/") != dev_path) {
+        log_message("ERROR", "Invalid loop device: %s", dev_path);
+        return -1;
+    }
+
+    strncpy(loop_dev, dev_path, MAX_PATH_LEN - 1);
+
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s", mount_point);
+    system(cmd);
+
+    snprintf(cmd, sizeof(cmd), "mount -t iso9660 -o ro %s %s 2>&1", dev_path, mount_point);
+    int ret = system(cmd);
+    if (ret != 0) {
+        log_message("ERROR", "Failed to mount ISO: %d", ret);
+        snprintf(cmd, sizeof(cmd), "losetup -d %s 2>/dev/null", dev_path);
+        system(cmd);
+        return -1;
+    }
+
+    log_message("INFO", "ISO mounted at %s", mount_point);
+    return 0;
+}
+
+static int unmount_iso_linux(const char *loop_dev, const char *mount_point) {
+    log_message("INFO", "Unmounting ISO from %s", mount_point);
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "umount %s 2>/dev/null", mount_point);
+    system(cmd);
+
+    snprintf(cmd, sizeof(cmd), "rmdir %s 2>/dev/null", mount_point);
+    system(cmd);
+
+    if (loop_dev && strlen(loop_dev) > 0) {
+        snprintf(cmd, sizeof(cmd), "losetup -d %s 2>/dev/null", loop_dev);
+        system(cmd);
+    }
+
+    log_message("INFO", "ISO unmounted");
+    return 0;
+}
+
+static int mount_partition_linux(const char *partition, const char *mount_point) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "mkdir -p %s", mount_point);
+    system(cmd);
+
+    if (strstr(partition, "ntfs") != NULL) {
+        snprintf(cmd, sizeof(cmd), "mount -t ntfs-3g -o ro %s %s 2>&1", partition, mount_point);
+    } else {
+        snprintf(cmd, sizeof(cmd), "mount -o ro %s %s 2>&1", partition, mount_point);
+    }
+
+    int ret = system(cmd);
+    if (ret != 0) {
+        snprintf(cmd, sizeof(cmd), "mount %s %s 2>&1", partition, mount_point);
+        system(cmd);
+    }
+
+    return 0;
+}
+
+static int copy_file_recursive(const char *src, const char *dst, void *ctx) {
+    write_context_t *wctx = (write_context_t *)ctx;
+    struct stat st;
+
+    if (lstat(src, &st) != 0) {
+        log_message("ERROR", "Cannot stat: %s", src);
+        return -1;
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        mkdir(dst, 0755);
+        DIR *dir = opendir(src);
+        if (!dir) return -1;
+
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+
+            char src_path[MAX_PATH_LEN];
+            char dst_path[MAX_PATH_LEN];
+            snprintf(src_path, sizeof(src_path), "%s/%s", src, entry->d_name);
+            snprintf(dst_path, sizeof(dst_path), "%s/%s", dst, entry->d_name);
+
+            copy_file_recursive(src_path, dst_path, ctx);
+        }
+        closedir(dir);
+    } else if (S_ISREG(st.st_mode)) {
+        FILE *in = fopen(src, "rb");
+        if (!in) return -1;
+
+        FILE *out = fopen(dst, "wb");
+        if (!out) {
+            fclose(in);
+            return -1;
+        }
+
+        char buf[65536];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+            fwrite(buf, 1, n, out);
+        }
+
+        fclose(in);
+        fclose(out);
+
+        wctx->files_copied++;
+        if (wctx->files_total > 0) {
+            wctx->progress = (double)wctx->files_copied / (double)wctx->files_total * 100.0;
+        }
+    }
+
+    return 0;
+}
+
+static uint64_t count_files_in_dir(const char *dir) {
+    uint64_t count = 0;
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+
+    struct dirent *entry;
+    char path[MAX_PATH_LEN];
+
+    while ((entry = readdir(d)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        snprintf(path, sizeof(path), "%s/%s", dir, entry->d_name);
+        struct stat st;
+        if (lstat(path, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) {
+                count += count_files_in_dir(path);
+            } else if (S_ISREG(st.st_mode)) {
+                count++;
+            }
+        }
+    }
+
+    closedir(d);
+    return count;
+}
+
+static int find_efi_files(const char *src_dir, char efi_boot_src[MAX_PATH_LEN], char efi_microsoft_src[MAX_PATH_LEN]) {
+    char path[MAX_PATH_LEN];
+
+    snprintf(path, sizeof(path), "%s/efi/Boot", src_dir);
+    if (access(path, F_OK) == 0) {
+        strncpy(efi_boot_src, path, MAX_PATH_LEN - 1);
+    }
+
+    snprintf(path, sizeof(path), "%s/efi/Microsoft/Boot", src_dir);
+    if (access(path, F_OK) == 0) {
+        strncpy(efi_microsoft_src, path, MAX_PATH_LEN - 1);
+    }
+
+    return 0;
+}
+
+static int has_large_wim(const char *dir) {
+    char wim_path[MAX_PATH_LEN];
+    struct stat st;
+
+    snprintf(wim_path, sizeof(wim_path), "%s/sources/install.wim", dir);
+    if (stat(wim_path, &st) == 0 && st.st_size > (4ULL * 1024 * 1024 * 1024)) {
+        return 1;
+    }
+
+    snprintf(wim_path, sizeof(wim_path), "%s/sources/boot.wim", dir);
+    if (stat(wim_path, &st) == 0 && st.st_size > (4ULL * 1024 * 1024 * 1024)) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int validate_usb_contents(const char *mount_point) {
+    char path[MAX_PATH_LEN];
+    int errors = 0;
+
+    log_message("INFO", "=== USB Validation ===");
+
+    snprintf(path, sizeof(path), "%s/efi/Boot", mount_point);
+    if (access(path, F_OK) == 0) {
+        log_message("INFO", "[OK] EFI/Boot present");
+    } else {
+        log_message("ERROR", "[FAIL] EFI/Boot missing");
+        errors++;
+    }
+
+    snprintf(path, sizeof(path), "%s/efi/Microsoft/Boot", mount_point);
+    if (access(path, F_OK) == 0) {
+        log_message("INFO", "[OK] EFI/Microsoft/Boot present");
+    } else {
+        log_message("ERROR", "[FAIL] EFI/Microsoft/Boot missing");
+        errors++;
+    }
+
+    snprintf(path, sizeof(path), "%s/sources/boot.wim", mount_point);
+    if (access(path, F_OK) == 0) {
+        log_message("INFO", "[OK] sources/boot.wim present");
+    } else {
+        log_message("ERROR", "[FAIL] sources/boot.wim missing");
+        errors++;
+    }
+
+    snprintf(path, sizeof(path), "%s/sources/setup.exe", mount_point);
+    if (access(path, F_OK) == 0) {
+        log_message("INFO", "[OK] sources/setup.exe present");
+    } else {
+        log_message("ERROR", "[FAIL] sources/setup.exe missing");
+        errors++;
+    }
+
+    char wim_path[MAX_PATH_LEN];
+    snprintf(wim_path, sizeof(wim_path), "%s/sources/install.wim", mount_point);
+    snprintf(path, sizeof(path), "%s/sources/install.swm", mount_point);
+    if (access(wim_path, F_OK) == 0 || access(path, F_OK) == 0) {
+        log_message("INFO", "[OK] Installation image present (WIM or SWM)");
+    } else {
+        log_message("ERROR", "[FAIL] install.wim/install.swm missing");
+        errors++;
+    }
+
+    log_message("INFO", "=== Validation %s ===\n", errors == 0 ? "PASSED" : "FAILED");
+    return errors;
+}
+
+static int windows_usb_write(const char *iso_path, const char *device_path, write_context_t *ctx) {
+#if defined(__linux__)
+    log_message("INFO", "Starting Windows USB creation: %s -> %s", iso_path, device_path);
+
+    pthread_mutex_lock(&app.mutex);
+    ctx->state = STATE_PREPARING;
+    snprintf(ctx->message, sizeof(ctx->message), "Preparing Windows USB...");
+    pthread_mutex_unlock(&app.mutex);
+
+    check_required_tools();
+
+    char data_partition[MAX_PATH_LEN];
+    char temp_mount[MAX_PATH_LEN] = "/tmp/uniximage_iso";
+    char data_mount[MAX_PATH_LEN] = "/tmp/uniximage_data";
+
+    const char *dev_name = strrchr(device_path, '/');
+    if (dev_name) dev_name++;
+    else dev_name = device_path;
+
+    snprintf(data_partition, sizeof(data_partition), "/dev/%s1", dev_name);
+
+    unmount_device(device_path);
+    usleep(500000);
+
+    pthread_mutex_lock(&app.mutex);
+    ctx->state = STATE_UNMOUNTING;
+    snprintf(ctx->message, sizeof(ctx->message), "Wiping USB device...");
+    pthread_mutex_unlock(&app.mutex);
+
+    log_message("INFO", "Stage 1: Wiping and repartitioning USB");
+    if (wipe_device_linux(device_path) != 0) {
+        log_message("ERROR", "Failed to wipe device");
+        return -1;
+    }
+
+    uint64_t dev_size = get_device_size(device_path);
+
+    log_message("INFO", "Creating single FAT32 partition (Windows USB method)");
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), "parted -s %s mklabel gpt 2>&1", device_path);
+    system(cmd);
+    usleep(500000);
+
+    uint64_t part_start = 2048;
+    uint64_t part_end = (dev_size / 512) - 2048;
+
+    snprintf(cmd, sizeof(cmd),
+        "parted -s %s mkpart Windows fat32 %luk %luk 2>&1",
+        device_path, (unsigned long)(part_start / 2048), (unsigned long)(part_end / 2048));
+    system(cmd);
+    usleep(500000);
+
+    snprintf(cmd, sizeof(cmd), "parted -s %s set 1 boot on 2>&1", device_path);
+    snprintf(cmd, sizeof(cmd), "parted -s %s set 1 esp on 2>&1", device_path);
+    system(cmd);
+    sync();
+
+    pthread_mutex_lock(&app.mutex);
+    ctx->state = STATE_WRITING;
+    snprintf(ctx->message, sizeof(ctx->message), "Formatting as FAT32...");
+    pthread_mutex_unlock(&app.mutex);
+
+    log_message("INFO", "Stage 2: Formatting as FAT32");
+    if (format_partition(data_partition, "fat32", "WINUSB") != 0) {
+        log_message("ERROR", "Failed to format as FAT32");
+        return -1;
+    }
+
+    pthread_mutex_lock(&app.mutex);
+    ctx->state = STATE_WRITING;
+    snprintf(ctx->message, sizeof(ctx->message), "Mounting Windows ISO...");
+    pthread_mutex_unlock(&app.mutex);
+
+    log_message("INFO", "Stage 3: Mounting Windows ISO");
+    if (mount_iso_linux(iso_path, ctx->win_loop_dev, temp_mount) != 0) {
+        log_message("ERROR", "Failed to mount ISO");
+        unmount_iso_linux(ctx->win_loop_dev, temp_mount);
+        return -1;
+    }
+
+    strncpy(ctx->win_iso_path, temp_mount, MAX_PATH_LEN - 1);
+
+    uint64_t wim_size = 0;
+    get_wim_size(temp_mount, &wim_size);
+
+    uint64_t fat32_max = (uint64_t)(4ULL - 1) * 1024 * 1024 * 1024;
+    uint64_t part_capacity = dev_size - (512 * 2048);
+
+    int needs_split = 0;
+    int can_split = check_tool("wimsplit");
+
+    log_message("INFO", "=== Preflight Check ===");
+    log_message("INFO", "FAT32 partition capacity: %llu bytes (%llu MB)",
+        (unsigned long long)part_capacity,
+        (unsigned long long)(part_capacity / (1024 * 1024)));
+    log_message("INFO", "install.wim size: %llu bytes (%llu MB)",
+        (unsigned long long)wim_size,
+        (unsigned long long)(wim_size / (1024 * 1024)));
+
+    if (wim_size > (4ULL * 1024 * 1024 * 1024)) {
+        log_message("INFO", "install.wim exceeds 4GB - splitting required");
+        needs_split = 1;
+        if (!can_split) {
+            log_message("ERROR", "FAT32 file size limit: install.wim is >4GB but wimsplit tool is NOT available");
+            log_message("ERROR", "Cannot proceed: large WIM cannot be stored on FAT32 without splitting");
+            unmount_iso_linux(ctx->win_loop_dev, temp_mount);
+            pthread_mutex_lock(&app.mutex);
+            ctx->state = STATE_ERROR;
+            ctx->error_code = ENOTSUP;
+            snprintf(ctx->message, sizeof(ctx->message),
+                "install.wim > 4GB but wimsplit not found. Install wimtools package.");
+            pthread_mutex_unlock(&app.mutex);
+            return -1;
+        }
+        log_message("INFO", "wimsplit tool available - will split install.wim into .swm files");
+    } else {
+        log_message("INFO", "install.wim fits in FAT32 - no splitting needed");
+    }
+
+    pthread_mutex_lock(&app.mutex);
+    ctx->state = STATE_WRITING;
+    snprintf(ctx->message, sizeof(ctx->message), "Copying files to USB...");
+    pthread_mutex_unlock(&app.mutex);
+
+    log_message("INFO", "Stage 4: Copying files to FAT32 partition");
+
+    mount_partition_linux(data_partition, data_mount);
+    strncpy(ctx->win_ntfs_mount, data_mount, MAX_PATH_LEN - 1);
+
+    ctx->files_total = count_files_in_dir(temp_mount);
+    ctx->files_copied = 0;
+    log_message("INFO", "Total files to copy: %lu", (unsigned long)ctx->files_total);
+
+    copy_file_recursive(temp_mount, data_mount, ctx);
+
+    if (needs_split && can_split) {
+        log_message("INFO", "Splitting install.wim for FAT32 compatibility");
+
+        char wim_source[MAX_PATH_LEN];
+        char wim_source_full[MAX_PATH_LEN];
+        snprintf(wim_source, sizeof(wim_source), "%s/sources/install.wim", temp_mount);
+        snprintf(wim_source_full, sizeof(wim_source_full), "%s/sources/install.wim", data_mount);
+
+        if (access(wim_source, F_OK) == 0 &&
+            access(wim_source_full, F_OK) == 0) {
+
+            snprintf(cmd, sizeof(cmd),
+                "wimsplit %s %s/sources/install.swm 4095 2>&1",
+                wim_source_full, data_mount);
+            int ret = system(cmd);
+            if (ret == 0 && access(wim_source_full, F_OK) != 0) {
+                log_message("INFO", "install.wim split successfully, original removed");
+            } else {
+                log_message("ERROR", "wimsplit failed or original WIM still exists");
+                unmount_iso_linux(ctx->win_loop_dev, temp_mount);
+                snprintf(cmd, sizeof(cmd), "umount %s 2>/dev/null", data_mount);
+                system(cmd);
+                pthread_mutex_lock(&app.mutex);
+                ctx->state = STATE_ERROR;
+                ctx->error_code = EIO;
+                snprintf(ctx->message, sizeof(ctx->message), "WIM split failed");
+                pthread_mutex_unlock(&app.mutex);
+                return -1;
+            }
+
+            char swm_check[MAX_PATH_LEN];
+            snprintf(swm_check, sizeof(swm_check), "%s/sources/install.swm", data_mount);
+            if (access(swm_check, F_OK) == 0) {
+                log_message("INFO", "install.swm verified at correct location");
+            }
+        }
+    }
+
+    log_message("INFO", "Stage 5: Validating USB contents");
+    snprintf(cmd, sizeof(cmd), "umount %s 2>/dev/null", data_mount);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "mount %s %s 2>&1", data_partition, data_mount);
+    system(cmd);
+
+    int valid = validate_usb_contents(data_mount);
+
+    snprintf(cmd, sizeof(cmd), "umount %s 2>/dev/null", data_mount);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "rmdir %s 2>/dev/null", data_mount);
+    system(cmd);
+
+    unmount_iso_linux(ctx->win_loop_dev, temp_mount);
+
+    if (valid != 0) {
+        log_message("ERROR", "USB validation failed - missing required files");
+        pthread_mutex_lock(&app.mutex);
+        ctx->state = STATE_ERROR;
+        ctx->error_code = EIO;
+        snprintf(ctx->message, sizeof(ctx->message), "USB validation failed");
+        pthread_mutex_unlock(&app.mutex);
+        return -1;
+    }
+
+    pthread_mutex_lock(&app.mutex);
+    ctx->state = STATE_COMPLETE;
+    ctx->progress = 100.0;
+    snprintf(ctx->message, sizeof(ctx->message), "Complete!");
+    pthread_mutex_unlock(&app.mutex);
+
+    log_message("INFO", "Windows USB creation completed successfully");
+
+    sync();
+    return 0;
+#else
+    log_message("ERROR", "Windows mode not supported on this platform");
+    return -1;
+#endif
+}
+#endif
 
 static int setup_windows_boot(const char *device_path, partition_scheme_t scheme) {
 #if defined(__linux__)
@@ -1241,19 +1877,107 @@ int unmount_device(const char *device) {
 
 void *write_thread(void *arg) {
     (void)arg;
-    
+
     write_context_t *ctx = &app.ctx;
     const char *image_path = app.image.path;
     const char *device_path = app.selected_device->path;
-    
+
     int src_fd = -1, dst_fd = -1;
     unsigned char *buffer = NULL;
-    
+
+    int is_windows = is_windows_image(image_path);
+    if (is_windows > 0) {
+        log_message("INFO", "Windows ISO detected (confidence: %d)", is_windows);
+        ctx->mode = WRITE_MODE_WINDOWS;
+    } else {
+        ctx->mode = WRITE_MODE_RAW;
+    }
+
+#if defined(__linux__)
+    if (ctx->mode == WRITE_MODE_WINDOWS) {
+        FILE *f = fopen("/proc/cmdline", "r");
+        char root_dev[256] = "";
+        if (f) {
+            char cmdline[1024];
+            if (fgets(cmdline, sizeof(cmdline), f)) {
+                char *p = strstr(cmdline, "root=");
+                if (p) {
+                    p += 5;
+                    char *end = strchr(p, ' ');
+                    if (end) *end = '\0';
+                    strncpy(root_dev, p, sizeof(root_dev) - 1);
+                }
+            }
+            fclose(f);
+        }
+
+        const char *dev_name = strrchr(device_path, '/');
+        if (dev_name) dev_name++;
+        else dev_name = device_path;
+
+        if (strncmp(dev_name, "sd", 2) == 0 && strlen(dev_name) >= 3) {
+            if (strlen(root_dev) > 0) {
+                char root_base[64];
+                strncpy(root_base, root_dev + 5, sizeof(root_base) - 1);
+                char *p = root_base;
+                while (*p && !isdigit((unsigned char)*p)) p++;
+                *p = '\0';
+
+                if (strcmp(dev_name, root_base) == 0) {
+                    pthread_mutex_lock(&app.mutex);
+                    ctx->state = STATE_ERROR;
+                    ctx->error_code = EACCES;
+                    snprintf(ctx->message, sizeof(ctx->message),
+                        "Refusing to write to system disk %s", device_path);
+                    pthread_mutex_unlock(&app.mutex);
+                    log_message("ERROR", "SAFETY: Refusing to write to system disk %s", device_path);
+                    goto cleanup;
+                }
+            }
+        }
+    }
+#endif
+
+    if (ctx->mode == WRITE_MODE_WINDOWS) {
+#if defined(__linux__)
+        log_message("INFO", "Using Windows file-based installation mode");
+
+        if (geteuid() != 0) {
+            pthread_mutex_lock(&app.mutex);
+            ctx->state = STATE_ERROR;
+            ctx->error_code = EACCES;
+            snprintf(ctx->message, sizeof(ctx->message), "Root privileges required for Windows mode");
+            pthread_mutex_unlock(&app.mutex);
+            log_message("ERROR", "Root privileges required for Windows mode");
+            goto cleanup;
+        }
+
+        int ret = windows_usb_write(image_path, device_path, ctx);
+        if (ret != 0) {
+            pthread_mutex_lock(&app.mutex);
+            ctx->state = STATE_ERROR;
+            ctx->error_code = EIO;
+            snprintf(ctx->message, sizeof(ctx->message), "Windows USB creation failed");
+            pthread_mutex_unlock(&app.mutex);
+            log_message("ERROR", "Windows USB creation failed");
+        }
+
+        goto cleanup;
+#else
+        pthread_mutex_lock(&app.mutex);
+        ctx->state = STATE_ERROR;
+        ctx->error_code = ENOTSUP;
+        snprintf(ctx->message, sizeof(ctx->message), "Windows mode not supported on this platform");
+        pthread_mutex_unlock(&app.mutex);
+        goto cleanup;
+#endif
+    }
+
     pthread_mutex_lock(&app.mutex);
     ctx->state = STATE_PREPARING;
     snprintf(ctx->message, sizeof(ctx->message), "Preparing...");
     pthread_mutex_unlock(&app.mutex);
-    
+
     log_message("INFO", "Starting write: %s -> %s", image_path, device_path);
     
     buffer = malloc(ctx->block_size);
@@ -1469,15 +2193,15 @@ void *write_thread(void *arg) {
     snprintf(ctx->message, sizeof(ctx->message), "Complete!");
     pthread_mutex_unlock(&app.mutex);
     
-    if (ctx->make_bootable) {
+    if (ctx->make_bootable && ctx->mode != WRITE_MODE_WINDOWS) {
         pthread_mutex_lock(&app.mutex);
         ctx->state = STATE_PREPARING;
         snprintf(ctx->message, sizeof(ctx->message), "Setting up bootable...");
         pthread_mutex_unlock(&app.mutex);
-        
+
         setup_windows_boot(device_path, ctx->partition_scheme);
     }
-    
+
     log_message("INFO", "Write completed successfully");
     
 cleanup:
@@ -1689,35 +2413,47 @@ gboolean update_progress(gpointer user_data) {
     return G_SOURCE_CONTINUE;
 }
 
+static int try_pkexec(const char *exe_path, const char *action_id) {
+    char cmd[1024];
+    if (action_id) {
+        snprintf(cmd, sizeof(cmd), "pkexec --action-id %s %s --sudo-mode", exe_path, action_id);
+    } else {
+        snprintf(cmd, sizeof(cmd), "pkexec %s --sudo-mode", exe_path);
+    }
+    return system(cmd);
+}
+
+static int try_gksu(const char *exe_path) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "gksu %s --sudo-mode", exe_path);
+    return system(cmd);
+}
+
+static int try_kdesu(const char *exe_path) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "kdesu -c %s --sudo-mode", exe_path);
+    return system(cmd);
+}
+
 static int run_with_sudo(const char *args[]) {
     char exe_path[MAX_PATH_LEN];
     ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
     if (len <= 0) return 0;
     exe_path[len] = '\0';
-    
-    int fd_pipe[2];
-    if (pipe(fd_pipe) != 0) return 0;
-    
-    pid_t pid = fork();
-    if (pid < 0) { close(fd_pipe[0]); close(fd_pipe[1]); return 0; }
-    
-    if (pid == 0) {
-        close(fd_pipe[0]);
-        close(fd_pipe[1]);
-        dup2(fd_pipe[1], STDOUT_FILENO);
-        dup2(fd_pipe[1], STDERR_FILENO);
-        close(fd_pipe[1]);
-        
-        execv(exe_path, (char**)args);
-        _exit(127);
-    }
-    
-    close(fd_pipe[1]);
-    close(fd_pipe[0]);
-    
-    int status;
-    waitpid(pid, &status, 0);
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+
+    int ret = try_pkexec(exe_path, "com.uniximage.write");
+    if (ret == 0) return 1;
+
+    ret = try_pkexec(exe_path, NULL);
+    if (ret == 0) return 1;
+
+    ret = try_gksu(exe_path);
+    if (ret == 0) return 1;
+
+    ret = try_kdesu(exe_path);
+    if (ret == 0) return 1;
+
+    return 0;
 }
 
 void on_write_clicked(GtkButton *button, gpointer user_data) {
@@ -2201,19 +2937,19 @@ int cli_write(const char *image_path, const char *device_path,
 
 int main(int argc, char *argv[]) {
     setlocale(LC_ALL, "");
-    
+
     memset(&app, 0, sizeof(app_t));
     pthread_mutex_init(&app.mutex, NULL);
-    
+
     app.os = detect_os();
     get_os_version(app.os_version, sizeof(app.os_version));
     strncpy(app.os_name, get_os_name(app.os), sizeof(app.os_name) - 1);
     app.is_root = (geteuid() == 0);
-    
+
     app.log_file = fopen(LOG_FILE, "a");
-    
+
     log_message("INFO", "UnixImage v%s starting on %s", VERSION, app.os_name);
-    
+
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     
@@ -2276,8 +3012,35 @@ int main(int argc, char *argv[]) {
     
     if (image_file && device_file) {
         cli_mode = 1;
+}
+
+#ifndef CLI_MODE
+    if (!app.is_root && !app.sudo_mode) {
+        char exe_path[MAX_PATH_LEN];
+        ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+        if (len > 0) {
+            exe_path[len] = '\0';
+            fprintf(stderr, "Requesting administrator privileges...\n");
+
+            char cmd[1024];
+            snprintf(cmd, sizeof(cmd),
+                "pkexec --action-id com.uniximage.write "
+                "--message \"UnixImage needs administrator access to write disk images. "
+                "Only the selected target device will be modified.\" "
+                "%s --sudo-mode",
+                exe_path);
+
+            int ret = system(cmd);
+            if (ret == 0) {
+                app.log_file = fopen(LOG_FILE, "a");
+                log_message("INFO", "Authenticated via pkexec");
+            } else {
+                fprintf(stderr, "Authentication cancelled. Device enumeration may be limited.\n");
+            }
+        }
     }
-    
+#endif
+
     if (cli_mode) {
         if (!image_file || !device_file) {
             fprintf(stderr, "Error: Image and device must be specified in CLI mode.\n");
