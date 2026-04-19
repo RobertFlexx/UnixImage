@@ -1,154 +1,201 @@
-# UnixImage, portable by standard. Break a leg!
+<p align="center">
+  <img src="uniximage.svg" alt="UnixImage logo" width="420">
+</p>
 
-> Universal disk image writer for (most) Unix and Unix-like operating systems.
+<h1 align="center">UnixImage</h1>
+<p align="center"><strong>Portable by standard. Break a leg!</strong></p>
 
-> Some random stupid thing i made because these operating systems have no gui ISO image writing software.
+<p align="center">
+  A cross-platform disk image writer for Unix and Unix-like systems, with both GTK GUI and CLI modes.
+</p>
 
-> Youre welcome.
+UnixImage is a straightforward image writer built in C for people who want a native-feeling tool instead of a giant kitchen-sink app.
 
-> Disclaimer: Linux, and FreeBSD tested. Others may not work, or may not work reliably.
+It is designed to write disk images to removable media with a GUI when GTK3 is available, while still supporting a CLI-only build for lean systems and minimal environments.
 
-> Heads up: AI was used in this project (a light amount) as a productivity tool, rather than being the          author itself. Making this known due to the uprising of AI slop, which you dont have to worry here.
+## What it does
 
-## Supported Systems
+* Writes disk images to target devices
+* Supports both GUI and CLI builds
+* Detects many common disk image formats
+* Handles several compressed image formats
+* Includes optional verification after writing
+* Includes sync-write support
+* Exposes block size, partition, and bootable options in the GUI
+* Ships with desktop integration assets and an install script
 
-* Linux (all distributions)
+## Project layout (just so ya know)
+
+* `uniximage.c` - main source file
+* `install.sh` - install helper that builds and installs the app
+* `uniximage.desktop` - desktop entry
+* `uniximage.svg` - scalable app icon
+* `uniximage.png` - 256x256 icon
+* `uniximage-128.png` - 128x128 icon
+* `uniximage-48.png` - 48x48 icon
+* `LICENSE` - GPLv3
+* `README.md` - this file
+
+## Platform status (tested vs untested)
+
+### Tested
+
+* Linux
+* FreeBSD
+
+### Implemented in source
+
+* Linux
 * macOS
 * FreeBSD
-* OpenBSD
-* NetBSD
 * DragonFly BSD
 
-# Experimental (untested)
+### Experimental or not fully verified
 
-* Solaris
-* illumos (OpenIndiana, SmartOS, OmniOS)
-* MidnightBSD
-* HardenedBSD
-* GhostBSD
+* OpenBSD
+* NetBSD
+* Solaris / illumos
 * AIX
 * HP-UX
-* IRIX
-* QNX
-* MINIX
-* Haiku
-* GNU/Hurd
+* Other Unix-like targets may compile or partially work, but are not guaranteed
 
-## Supported Image Formats
+## Supported image formats
 
-ISO, IMG, RAW, DMG, VHD, VHDX, VDI, VMDK, QCOW, QCOW2
+### Disk images
 
-Compressed formats: XZ, GZ, BZ2, ZSTD, LZ4, ZIP
+* ISO
+* IMG
+* RAW
+* DMG
+* VHD
+* VHDX
+* VDI
+* VMDK
+* QCOW
+* QCOW2
+* WIM
+* SWM
+
+### Compressed images
+
+* XZ
+* GZ
+* BZ2
+* ZSTD
+* LZ4
+* ZIP
 
 ## Dependencies
 
-GUI mode requires GTK3. CLI mode has no dependencies beyond libc and pthreads.
+GUI mode requires GTK3.
+
+CLI mode only requires a C compiler, libc, and pthreads.
 
 ## Building
 
-### Linux (Debian/Ubuntu)
+### GUI build
 
-```
-apt install build-essential libgtk-3-dev
+```bash
 cc -o uniximage uniximage.c $(pkg-config --cflags --libs gtk+-3.0) -lpthread
 ```
 
-### Linux (Fedora/RHEL)
+### CLI-only build
 
+```bash
+cc -o uniximage uniximage.c -DCLI_MODE -lpthread
 ```
-dnf install gcc gtk3-devel
+
+## Build examples
+
+### Debian / Ubuntu
+
+```bash
+apt install build-essential libgtk-3-dev pkg-config
 cc -o uniximage uniximage.c $(pkg-config --cflags --libs gtk+-3.0) -lpthread
 ```
 
-### Linux (Arch)
+### Fedora / RHEL
 
+```bash
+dnf install gcc gtk3-devel pkgconf-pkg-config
+cc -o uniximage uniximage.c $(pkg-config --cflags --libs gtk+-3.0) -lpthread
 ```
-pacman -S base-devel gtk3
+
+### Arch Linux
+
+```bash
+pacman -S base-devel gtk3 pkgconf
 cc -o uniximage uniximage.c $(pkg-config --cflags --libs gtk+-3.0) -lpthread
 ```
 
 ### FreeBSD
 
-```
+```bash
 pkg install gtk3 pkgconf
 cc -o uniximage uniximage.c $(pkg-config --cflags --libs gtk+-3.0) -lpthread
 ```
 
 ### OpenBSD
 
-```
-pkg_add gtk+3
+```bash
+pkg_add gtk+3 pkgconf
 cc -o uniximage uniximage.c $(pkg-config --cflags --libs gtk+-3.0) -lpthread
 ```
 
 ### NetBSD
 
-```
-pkgin install gtk3
-cc -o uniximage uniximage.c $(pkg-config --cflags --libs gtk+-3.0) -lpthread
-```
-
-### DragonFly BSD
-
-```
-pkg install gtk3 pkgconf
+```bash
+pkgin install gtk3 pkgconf
 cc -o uniximage uniximage.c $(pkg-config --cflags --libs gtk+-3.0) -lpthread
 ```
 
 ### macOS
 
-```
+```bash
 brew install gtk+3 pkg-config
 cc -o uniximage uniximage.c $(pkg-config --cflags --libs gtk+-3.0) -lpthread
 ```
 
-### Solaris/illumos
+## Install
 
-```
-pkg install gtk3 developer/build/pkg-config
-cc -o uniximage uniximage.c $(pkg-config --cflags --libs gtk+-3.0) -lpthread
+The repository includes an install script that builds the CLI version, attempts the GTK GUI build, and installs the binary, desktop file, and icons under `/usr/local` by default.
+
+```bash
+sudo ./install.sh
 ```
 
-### CLI-only build (any system)
+To install somewhere else:
 
-```
-cc -o uniximage uniximage.c -DCLI_MODE -lpthread
+```bash
+sudo INSTALL_PREFIX=/usr ./install.sh
 ```
 
 ## Usage
 
-### GUI mode
+### GUI
 
-```
+```bash
 sudo ./uniximage
 ```
 
-### CLI mode
+### CLI
 
-```
+```bash
 sudo ./uniximage -i image.iso -d /dev/sdX
 sudo ./uniximage -i image.iso -d /dev/sdX -V -y
 sudo ./uniximage --list
 ```
 
-### Options
+## Notes
 
-```
--h, --help        Show help
--v, --version     Show version
--l, --list        List available devices
--i, --image FILE  Image file
--d, --device DEV  Target device
--y, --yes         Skip confirmation
--V, --verify      Verify after writing
--b, --blocksize N Block size in bytes
--c, --cli         Force CLI mode
-```
+* Root privileges are generally required for writing directly to block devices
+* GTK3 is optional, not mandatory
+* Linux and FreeBSD are the currently tested targets
+* Other targets should be treated as experimental until verified
 
 ## License
 
 GPLv3
-
 
 ## Prologue
 
