@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=UnixImage Writer
+GenericName=ISO Image Writer
+Comment=Write ISO images to USB drives
+Exec=uniximage %f
+Icon=uniximage
+Terminal=false
+Categories=System;DiskUtility;
+MimeType=application/x-iso-image;
+Keywords=usb;iso;burn;write;disk;image;
+StartupNotify=false

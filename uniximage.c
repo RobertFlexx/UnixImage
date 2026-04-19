@@ -80,7 +80,7 @@
 #include <sys/diskio.h>
 #endif
 
-#define VERSION "1.0.0"
+#define VERSION "2.0"
 #define PROGRAM_NAME "UnixImage"
 #define MAX_DEVICES 64
 #define MAX_PATH_LEN 4096
@@ -134,7 +134,8 @@ typedef enum {
     IMG_BZ2,
     IMG_ZSTD,
     IMG_LZ4,
-    IMG_ZIP
+    IMG_ZIP,
+    IMG_WIM
 } image_type_t;
 
 typedef enum {
@@ -170,7 +171,14 @@ typedef struct {
     uint64_t size;
     image_type_t type;
     int compressed;
+    int is_windows;
 } image_info_t;
+
+typedef enum {
+    PARTscheme_AUTO,
+    PARTscheme_MBR,
+    PARTscheme_GPT
+} partition_scheme_t;
 
 typedef struct {
     write_state_t state;
@@ -186,6 +194,8 @@ typedef struct {
     int verify;
     int sync_writes;
     size_t block_size;
+    partition_scheme_t partition_scheme;
+    int make_bootable;
 } write_context_t;
 
 typedef struct {
@@ -201,6 +211,7 @@ typedef struct {
     char os_name[64];
     char os_version[128];
     int is_root;
+    int sudo_mode;
     FILE *log_file;
 #ifndef CLI_MODE
     GtkWidget *window;
@@ -215,6 +226,8 @@ typedef struct {
     GtkWidget *verify_check;
     GtkWidget *sync_check;
     GtkWidget *blocksize_combo;
+    GtkWidget *partition_combo;
+    GtkWidget *bootable_check;
     GtkListStore *device_store;
     guint timer_id;
 #endif
@@ -474,6 +487,8 @@ image_type_t detect_image_type(const char *path) {
     if (strcasecmp(ext, "zst") == 0) return IMG_ZSTD;
     if (strcasecmp(ext, "lz4") == 0) return IMG_LZ4;
     if (strcasecmp(ext, "zip") == 0) return IMG_ZIP;
+    if (strcasecmp(ext, "wim") == 0) return IMG_WIM;
+    if (strcasecmp(ext, "swm") == 0) return IMG_WIM;
     
     unsigned char magic[16];
     int fd = open(path, O_RDONLY);
@@ -492,6 +507,8 @@ image_type_t detect_image_type(const char *path) {
             if (memcmp(magic, "vhdxfile", 8) == 0) return IMG_VHDX;
             if (memcmp(magic, "KDMV", 4) == 0) return IMG_VMDK;
             if (memcmp(magic, "QFI\xFB", 4) == 0) return IMG_QCOW2;
+            if (n >= 16 && memcmp(magic, "MSWIM", 5) == 0) return IMG_WIM;
+            if (n >= 16 && memcmp(magic, "WIM", 3) == 0 && magic[3] == 0x00) return IMG_WIM;
         }
     }
     
@@ -516,6 +533,7 @@ const char *get_image_type_name(image_type_t type) {
         case IMG_ZSTD: return "Zstd Compressed";
         case IMG_LZ4: return "LZ4 Compressed";
         case IMG_ZIP: return "ZIP Archive";
+        case IMG_WIM: return "Windows WIM";
         default: return "Unknown";
     }
 }
@@ -523,6 +541,107 @@ const char *get_image_type_name(image_type_t type) {
 int is_compressed_image(image_type_t type) {
     return type == IMG_XZ || type == IMG_GZ || type == IMG_BZ2 || 
            type == IMG_ZSTD || type == IMG_LZ4 || type == IMG_ZIP;
+}
+
+int is_windows_image(const char *image_path) {
+    int fd = open(image_path, O_RDONLY);
+    if (fd < 0) return 0;
+    
+    char buf[65536];
+    ssize_t n = read(fd, buf, sizeof(buf));
+    close(fd);
+    
+    if (n < 512) return 0;
+    
+    if (strstr(buf, "sources/boot.wim") || strstr(buf, "sources/install.wim") ||
+        strstr(buf, "sources/bootx64.wim") || strstr(buf, "sources/installx64.wim") ||
+        strstr(buf, "\\sources\\boot.wim") || strstr(buf, "\\sources\\install.wim")) {
+        return 2;
+    }
+    
+    if (strstr(buf, "efi/microsoft") || strstr(buf, "EFI/Microsoft")) {
+        return 3;
+    }
+    
+    if (memmem(buf, n, "Microsoft Corporation", 21) && 
+        (memmem(buf, n, "Windows", 7) || memmem(buf, n, "BOOT", 4))) {
+        return 1;
+    }
+    
+    return 0;
+}
+
+static int setup_windows_boot(const char *device_path, partition_scheme_t scheme) {
+#if defined(__linux__)
+    int fd = open(device_path, O_RDONLY);
+    if (fd < 0) return -1;
+    
+    unsigned char mbr[512];
+    if (read(fd, mbr, 512) != 512) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    
+    if (scheme == PARTscheme_GPT || scheme == PARTscheme_AUTO) {
+        uint8_t gpt_header[92];
+        fd = open(device_path, O_RDONLY);
+        if (fd >= 0) {
+            lseek(fd, 512, SEEK_SET);
+            if (read(fd, gpt_header, 92) == 92) {
+                if (gpt_header[0] == 'E' && gpt_header[1] == 'F' && 
+                    gpt_header[2] == 'I' && gpt_header[3] == ' ') {
+                    close(fd);
+                    log_message("INFO", "GPT/UEFI signature detected - already bootable");
+                    return 0;
+                }
+            }
+            close(fd);
+        }
+    }
+    
+    fd = open(device_path, O_WRONLY);
+    if (fd < 0) return -1;
+    
+    if (scheme == PARTscheme_MBR || scheme == PARTscheme_AUTO) {
+        unsigned char bootcode[512];
+        memset(bootcode, 0, 512);
+        bootcode[440] = 0x80;
+        bootcode[441] = 0x00;
+        bootcode[442] = 0x00;
+        bootcode[443] = 0x00;
+        
+        bootcode[444] = 0x00;
+        bootcode[445] = 0xFE;
+        bootcode[446] = 0xFF;
+        bootcode[447] = 0x00;
+        
+        bootcode[448] = 0x00;
+        bootcode[449] = 0x00;
+        bootcode[450] = 0x00;
+        bootcode[451] = 0x00;
+        
+        bootcode[452] = 0x00;
+        bootcode[453] = 0x00;
+        bootcode[454] = 0x00;
+        bootcode[455] = 0x00;
+        
+        bootcode[510] = 0x55;
+        bootcode[511] = 0xAA;
+        
+        lseek(fd, 0, SEEK_SET);
+        write(fd, bootcode, 512);
+        
+        log_message("INFO", "MBR boot signature set (0x55AA)");
+    }
+    
+    close(fd);
+    return 0;
+#else
+    (void)device_path;
+    (void)scheme;
+    return 0;
+#endif
 }
 
 uint64_t get_device_size(const char *path) {
@@ -1350,6 +1469,15 @@ void *write_thread(void *arg) {
     snprintf(ctx->message, sizeof(ctx->message), "Complete!");
     pthread_mutex_unlock(&app.mutex);
     
+    if (ctx->make_bootable) {
+        pthread_mutex_lock(&app.mutex);
+        ctx->state = STATE_PREPARING;
+        snprintf(ctx->message, sizeof(ctx->message), "Setting up bootable...");
+        pthread_mutex_unlock(&app.mutex);
+        
+        setup_windows_boot(device_path, ctx->partition_scheme);
+    }
+    
     log_message("INFO", "Write completed successfully");
     
 cleanup:
@@ -1431,6 +1559,8 @@ void on_browse_clicked(GtkButton *button, gpointer user_data) {
     gtk_file_filter_add_pattern(filter, "*.xz");
     gtk_file_filter_add_pattern(filter, "*.gz");
     gtk_file_filter_add_pattern(filter, "*.bz2");
+    gtk_file_filter_add_pattern(filter, "*.wim");
+    gtk_file_filter_add_pattern(filter, "*.swm");
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
     
     GtkFileFilter *all_filter = gtk_file_filter_new();
@@ -1454,6 +1584,7 @@ void on_browse_clicked(GtkButton *button, gpointer user_data) {
         
         app.image.type = detect_image_type(filename);
         app.image.compressed = is_compressed_image(app.image.type);
+        app.image.is_windows = is_windows_image(filename);
         
         char display[MAX_PATH_LEN + 128];
         char size_str[32];
@@ -1558,9 +1689,73 @@ gboolean update_progress(gpointer user_data) {
     return G_SOURCE_CONTINUE;
 }
 
+static int run_with_sudo(const char *args[]) {
+    char exe_path[MAX_PATH_LEN];
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len <= 0) return 0;
+    exe_path[len] = '\0';
+    
+    int fd_pipe[2];
+    if (pipe(fd_pipe) != 0) return 0;
+    
+    pid_t pid = fork();
+    if (pid < 0) { close(fd_pipe[0]); close(fd_pipe[1]); return 0; }
+    
+    if (pid == 0) {
+        close(fd_pipe[0]);
+        close(fd_pipe[1]);
+        dup2(fd_pipe[1], STDOUT_FILENO);
+        dup2(fd_pipe[1], STDERR_FILENO);
+        close(fd_pipe[1]);
+        
+        execv(exe_path, (char**)args);
+        _exit(127);
+    }
+    
+    close(fd_pipe[1]);
+    close(fd_pipe[0]);
+    
+    int status;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
 void on_write_clicked(GtkButton *button, gpointer user_data) {
     (void)button;
     (void)user_data;
+    
+    if (geteuid() != 0) {
+        char exe_path[MAX_PATH_LEN];
+        ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+        if (len > 0) {
+            exe_path[len] = '\0';
+            const char *args[] = { exe_path, "--sudo-mode", NULL };
+            
+            if (!run_with_sudo(args)) {
+                GtkWidget *dialog = gtk_message_dialog_new(
+                    GTK_WINDOW(app.window),
+                    GTK_DIALOG_MODAL,
+                    GTK_MESSAGE_ERROR,
+                    GTK_BUTTONS_OK,
+                    "Failed to authenticate. Please run with sudo manually.");
+                gtk_dialog_run(GTK_DIALOG(dialog));
+                gtk_widget_destroy(dialog);
+                return;
+            }
+            gtk_main_quit();
+            return;
+        }
+        
+        GtkWidget *dialog = gtk_message_dialog_new(
+            GTK_WINDOW(app.window),
+            GTK_DIALOG_MODAL,
+            GTK_MESSAGE_ERROR,
+            GTK_BUTTONS_OK,
+            "Please run with sudo manually.");
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        return;
+    }
     
     if (strlen(app.image.path) == 0) {
         GtkWidget *dialog = gtk_message_dialog_new(
@@ -1629,6 +1824,14 @@ void on_write_clicked(GtkButton *button, gpointer user_data) {
     app.ctx.bytes_total = app.image.size;
     app.ctx.verify = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app.verify_check));
     app.ctx.sync_writes = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app.sync_check));
+    
+    int part_idx = gtk_combo_box_get_active(GTK_COMBO_BOX(app.partition_combo));
+    app.ctx.partition_scheme = (partition_scheme_t)part_idx;
+    app.ctx.make_bootable = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app.bootable_check));
+    
+    if (app.image.is_windows && !app.ctx.make_bootable) {
+        app.ctx.make_bootable = 1;
+    }
     
     gchar *block_size_str = gtk_combo_box_text_get_active_text(
         GTK_COMBO_BOX_TEXT(app.blocksize_combo));
@@ -1769,6 +1972,19 @@ void create_gui(void) {
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.blocksize_combo), "16 MB");
     gtk_combo_box_set_active(GTK_COMBO_BOX(app.blocksize_combo), 4);
     gtk_grid_attach(GTK_GRID(options_grid), app.blocksize_combo, 3, 0, 1, 1);
+    
+    GtkWidget *partition_label = gtk_label_new("Partition:");
+    gtk_grid_attach(GTK_GRID(options_grid), partition_label, 0, 1, 1, 1);
+    
+    app.partition_combo = gtk_combo_box_text_new();
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.partition_combo), "Auto (Recommended)");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.partition_combo), "MBR");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.partition_combo), "GPT");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(app.partition_combo), 0);
+    gtk_grid_attach(GTK_GRID(options_grid), app.partition_combo, 1, 1, 1, 1);
+    
+    app.bootable_check = gtk_check_button_new_with_label("Make bootable (Windows)");
+    gtk_grid_attach(GTK_GRID(options_grid), app.bootable_check, 0, 2, 2, 1);
     
     GtkWidget *progress_frame = gtk_frame_new("Progress");
     gtk_box_pack_start(GTK_BOX(main_box), progress_frame, FALSE, FALSE, 5);
@@ -2022,6 +2238,8 @@ int main(int argc, char *argv[]) {
             cli_mode = 1;
         } else if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0) {
             skip_confirm = 1;
+        } else if (strcmp(argv[i], "--sudo-mode") == 0) {
+            app.sudo_mode = 1;
         } else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--verify") == 0) {
             verify = 1;
         } else if ((strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--blocksize") == 0) 
