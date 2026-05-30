@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="uniximage.svg" alt="UnixImage logo" width="420">
-</p>
-
 <h1 align="center">UnixImage</h1>
 <p align="center"><strong>Portable by standard. Break a leg!</strong></p>
 
