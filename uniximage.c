@@ -211,6 +211,23 @@ typedef struct {
     uint64_t files_total;
 } write_context_t;
 
+#ifndef CLI_MODE
+typedef struct {
+    char image_path[MAX_PATH_LEN];
+    char device_path[MAX_PATH_LEN];
+    char status_file[MAX_PATH_LEN];
+    char last_output[1024];
+    int verify;
+    size_t block_size;
+    int result;
+    int started;
+    int status_seen;
+    time_t start_time;
+    guint poll_id;
+} privileged_write_job_t;
+
+#endif
+
 typedef struct {
     device_t devices[MAX_DEVICES];
     int device_count;
@@ -247,6 +264,8 @@ typedef struct {
 } app_t;
 
 static app_t app;
+static char app_exe_path[MAX_PATH_LEN];
+static char status_file_path[MAX_PATH_LEN];
 static volatile sig_atomic_t signal_received = 0;
 
 void log_message(const char *level, const char *fmt, ...) {
@@ -277,6 +296,27 @@ void log_message(const char *level, const char *fmt, ...) {
         fprintf(stderr, "\n");
     }
     va_end(args);
+}
+
+static void write_status_snapshot(const write_context_t *ctx) {
+    if (!status_file_path[0] || !ctx) return;
+
+    char tmp_path[MAX_PATH_LEN + 64];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%ld", status_file_path, (long)getpid());
+
+    FILE *f = fopen(tmp_path, "w");
+    if (!f) return;
+
+    fprintf(f, "%.3f\n", ctx->progress);
+    fprintf(f, "%lu\n", (unsigned long)ctx->bytes_written);
+    fprintf(f, "%lu\n", (unsigned long)ctx->bytes_total);
+    fprintf(f, "%.3f\n", ctx->speed);
+    fprintf(f, "%ld\n", (long)ctx->eta);
+    fprintf(f, "%d\n", (int)ctx->state);
+    fprintf(f, "%s\n", ctx->message);
+    fclose(f);
+
+    rename(tmp_path, status_file_path);
 }
 
 const char *get_os_name(os_type_t os) {
@@ -555,6 +595,130 @@ int is_compressed_image(image_type_t type) {
     return type == IMG_XZ || type == IMG_GZ || type == IMG_BZ2 || 
            type == IMG_ZSTD || type == IMG_LZ4 || type == IMG_ZIP;
 }
+
+static const char *decompressor_tool_for_type(image_type_t type) {
+    switch (type) {
+        case IMG_XZ:
+            if (access("/usr/bin/xz", X_OK) == 0 || access("/bin/xz", X_OK) == 0) return "xz";
+            return "xzcat";
+        case IMG_GZ:
+            if (access("/usr/bin/gzip", X_OK) == 0 || access("/bin/gzip", X_OK) == 0) return "gzip";
+            return "zcat";
+        case IMG_BZ2:
+            if (access("/usr/bin/bzip2", X_OK) == 0 || access("/bin/bzip2", X_OK) == 0) return "bzip2";
+            return "bzcat";
+        case IMG_ZSTD: return "zstd";
+        case IMG_LZ4: return "lz4";
+        case IMG_ZIP: return "unzip";
+        default: return NULL;
+    }
+}
+
+static int start_decompressor(image_type_t type, const char *path, pid_t *pid_out) {
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        log_message("ERROR", "pipe failed: %s", strerror(errno));
+        return -1;
+    }
+
+    const char *tool = decompressor_tool_for_type(type);
+    if (!tool) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        errno = EINVAL;
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        log_message("ERROR", "fork failed: %s", strerror(errno));
+        return -1;
+    }
+
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+
+        switch (type) {
+            case IMG_XZ:
+                if (strcmp(tool, "xz") == 0) execlp(tool, tool, "-dc", path, (char *)NULL);
+                else execlp(tool, tool, path, (char *)NULL);
+                break;
+            case IMG_GZ:
+                if (strcmp(tool, "gzip") == 0) execlp(tool, tool, "-dc", path, (char *)NULL);
+                else execlp(tool, tool, path, (char *)NULL);
+                break;
+            case IMG_BZ2:
+                if (strcmp(tool, "bzip2") == 0) execlp(tool, tool, "-dc", path, (char *)NULL);
+                else execlp(tool, tool, path, (char *)NULL);
+                break;
+            case IMG_ZSTD:
+                execlp(tool, tool, "-dc", path, (char *)NULL);
+                break;
+            case IMG_LZ4:
+                execlp(tool, tool, "-dc", path, (char *)NULL);
+                break;
+            case IMG_ZIP:
+                execlp(tool, tool, "-p", path, (char *)NULL);
+                break;
+            default:
+                break;
+        }
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+    *pid_out = pid;
+    return pipefd[0];
+}
+
+static int wait_for_reader(pid_t pid, const char *what) {
+    if (pid <= 0) return 0;
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        log_message("ERROR", "waitpid failed for %s: %s", what, strerror(errno));
+        return -1;
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        log_message("ERROR", "%s failed with status %d", what,
+                    WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int open_image_reader(const char *path, image_type_t type, pid_t *pid_out, const char **mode_out) {
+    *pid_out = -1;
+    *mode_out = "raw file";
+
+    if (!is_compressed_image(type)) {
+        return open(path, O_RDONLY);
+    }
+
+    const char *tool = decompressor_tool_for_type(type);
+    if (!tool) {
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    *mode_out = tool;
+    return start_decompressor(type, path, pid_out);
+}
+
+static int close_image_reader(int fd, pid_t pid, const char *mode) {
+    int rc = 0;
+    if (fd >= 0 && close(fd) != 0) rc = -1;
+    if (wait_for_reader(pid, mode) != 0) rc = -1;
+    return rc;
+}
+
 static int buffer_contains_ascii_ci(const unsigned char *haystack, size_t haystack_len,
                                     const char *needle) {
     size_t needle_len = strlen(needle);
@@ -672,6 +836,7 @@ static void set_write_status(write_context_t *ctx, write_state_t state, double p
     vsnprintf(ctx->message, sizeof(ctx->message), fmt, ap);
     va_end(ap);
     pthread_mutex_unlock(&app.mutex);
+    write_status_snapshot(ctx);
 }
 
 static int check_tool(const char *tool) {
@@ -1185,6 +1350,11 @@ static int copy_file_stream(const char *src, const char *dst, write_context_t *c
                 ctx->progress = (double)ctx->bytes_written / (double)ctx->bytes_total * 100.0;
                 if (ctx->progress > 99.0) ctx->progress = 99.0;
             }
+            char copied_buf[32], total_buf[32];
+            format_size(ctx->bytes_written, copied_buf, sizeof(copied_buf));
+            format_size(ctx->bytes_total, total_buf, sizeof(total_buf));
+            snprintf(ctx->message, sizeof(ctx->message), "Copying Windows files: %s / %s", copied_buf, total_buf);
+            write_status_snapshot(ctx);
         }
 
         if (rc != 0) break;
@@ -1443,6 +1613,8 @@ static int windows_usb_write(const char *iso_path, const char *device_path, writ
 
     if (!iso_mount || !usb_mount) {
         set_write_status(ctx, STATE_ERROR, -1.0, "Failed to create temporary mount directories");
+        if (iso_mount) rmdir(iso_mount);
+        if (usb_mount) rmdir(usb_mount);
         return -1;
     }
 
@@ -1684,8 +1856,60 @@ static int setup_windows_boot(const char *device_path, partition_scheme_t scheme
 #endif
 }
 
+#if defined(__linux__)
+static int linux_block_name_from_path(const char *path, char *out, size_t out_len) {
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    if (!name || !*name || out_len == 0) return -1;
+
+    snprintf(out, out_len, "%s", name);
+
+    size_t len = strlen(out);
+    char sysfs_path[512];
+    snprintf(sysfs_path, sizeof(sysfs_path), "/sys/block/%s", out);
+    if (access(sysfs_path, F_OK) == 0) return 0;
+
+    char *p = strrchr(out, 'p');
+    if (p && p > out && isdigit((unsigned char)p[1])) {
+        *p = '\0';
+        snprintf(sysfs_path, sizeof(sysfs_path), "/sys/block/%s", out);
+        if (access(sysfs_path, F_OK) == 0) return 0;
+    }
+
+    snprintf(out, out_len, "%s", name);
+    len = strlen(out);
+    while (len > 0 && isdigit((unsigned char)out[len - 1])) {
+        out[--len] = '\0';
+    }
+
+    if (len == 0) return -1;
+    snprintf(sysfs_path, sizeof(sysfs_path), "/sys/block/%s", out);
+    return access(sysfs_path, F_OK) == 0 ? 0 : -1;
+}
+
+static uint64_t read_u64_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    unsigned long long value = 0;
+    int ok = fscanf(f, "%llu", &value) == 1;
+    fclose(f);
+    return ok ? (uint64_t)value : 0;
+}
+#endif
+
 uint64_t get_device_size(const char *path) {
     uint64_t size = 0;
+
+#if defined(__linux__)
+    char block_name[128];
+    if (linux_block_name_from_path(path, block_name, sizeof(block_name)) == 0) {
+        char sysfs_path[512];
+        snprintf(sysfs_path, sizeof(sysfs_path), "/sys/block/%s/size", block_name);
+        uint64_t sectors = read_u64_file(sysfs_path);
+        if (sectors > 0) return sectors * 512ULL;
+    }
+#endif
+
     int fd = open(path, O_RDONLY);
     
     if (fd < 0) return 0;
@@ -1733,6 +1957,17 @@ uint64_t get_device_size(const char *path) {
 
 uint32_t get_device_sector_size(const char *path) {
     uint32_t sector_size = 512;
+
+#if defined(__linux__)
+    char block_name[128];
+    if (linux_block_name_from_path(path, block_name, sizeof(block_name)) == 0) {
+        char sysfs_path[512];
+        snprintf(sysfs_path, sizeof(sysfs_path), "/sys/block/%s/queue/logical_block_size", block_name);
+        uint64_t ss = read_u64_file(sysfs_path);
+        if (ss > 0 && ss <= UINT32_MAX) return (uint32_t)ss;
+    }
+#endif
+
     int fd = open(path, O_RDONLY);
     
     if (fd < 0) return sector_size;
@@ -1758,19 +1993,8 @@ uint32_t get_device_sector_size(const char *path) {
 int is_device_removable(const char *path) {
 #if defined(__linux__)
     char sysfs_path[512];
-    const char *dev_name = strrchr(path, '/');
-    if (!dev_name) return 0;
-    dev_name++;
-    
-    char base_name[64];
-    strncpy(base_name, dev_name, sizeof(base_name) - 1);
-    base_name[sizeof(base_name) - 1] = '\0';
-    
-    char *p = base_name;
-    while (*p && !isdigit((unsigned char)*p)) p++;
-    *p = '\0';
-    
-    if (strlen(base_name) == 0) return 0;
+    char base_name[128];
+    if (linux_block_name_from_path(path, base_name, sizeof(base_name)) != 0) return 0;
     
     snprintf(sysfs_path, sizeof(sysfs_path), 
              "/sys/block/%s/removable", base_name);
@@ -1799,7 +2023,8 @@ int is_device_removable(const char *path) {
 int is_device_readonly(const char *path) {
     int fd = open(path, O_WRONLY);
     if (fd < 0) {
-        if (errno == EROFS || errno == EACCES) return 1;
+        if (errno == EROFS) return 1;
+        if (errno == EACCES && geteuid() == 0) return 1;
         return 0;
     }
     close(fd);
@@ -1809,16 +2034,11 @@ int is_device_readonly(const char *path) {
 #if defined(__linux__)
 void get_device_model_linux(const char *dev_name, char *model, size_t len) {
     char sysfs_path[512];
-    char base_name[64];
-    
-    strncpy(base_name, dev_name, sizeof(base_name) - 1);
-    base_name[sizeof(base_name) - 1] = '\0';
-    
-    char *p = base_name;
-    while (*p && !isdigit((unsigned char)*p)) p++;
-    *p = '\0';
-    
-    if (strlen(base_name) == 0) return;
+    char dev_path[160];
+    char base_name[128];
+
+    snprintf(dev_path, sizeof(dev_path), "/dev/%s", dev_name);
+    if (linux_block_name_from_path(dev_path, base_name, sizeof(base_name)) != 0) return;
     
     snprintf(sysfs_path, sizeof(sysfs_path), 
              "/sys/block/%s/device/model", base_name);
@@ -1838,16 +2058,11 @@ void get_device_model_linux(const char *dev_name, char *model, size_t len) {
 
 void get_device_vendor_linux(const char *dev_name, char *vendor, size_t len) {
     char sysfs_path[512];
-    char base_name[64];
-    
-    strncpy(base_name, dev_name, sizeof(base_name) - 1);
-    base_name[sizeof(base_name) - 1] = '\0';
-    
-    char *p = base_name;
-    while (*p && !isdigit((unsigned char)*p)) p++;
-    *p = '\0';
-    
-    if (strlen(base_name) == 0) return;
+    char dev_path[160];
+    char base_name[128];
+
+    snprintf(dev_path, sizeof(dev_path), "/dev/%s", dev_name);
+    if (linux_block_name_from_path(dev_path, base_name, sizeof(base_name)) != 0) return;
     
     snprintf(sysfs_path, sizeof(sysfs_path), 
              "/sys/block/%s/device/vendor", base_name);
@@ -2287,7 +2502,11 @@ void *write_thread(void *arg) {
     const char *device_path = app.selected_device->path;
 
     int src_fd = -1, dst_fd = -1;
+    pid_t src_pid = -1;
+    const char *src_mode = "raw file";
     unsigned char *buffer = NULL;
+    image_type_t image_type = app.image.type;
+    int compressed = is_compressed_image(image_type);
 
     int is_windows = is_windows_image(image_path);
     if (is_windows > 0) {
@@ -2298,7 +2517,7 @@ void *write_thread(void *arg) {
     }
 
 #if defined(__linux__)
-    if (ctx->mode == WRITE_MODE_WINDOWS && target_has_critical_mount_linux(device_path)) {
+    if (target_has_critical_mount_linux(device_path)) {
         pthread_mutex_lock(&app.mutex);
         ctx->state = STATE_ERROR;
         ctx->error_code = EACCES;
@@ -2329,7 +2548,9 @@ void *write_thread(void *arg) {
             pthread_mutex_lock(&app.mutex);
             ctx->state = STATE_ERROR;
             ctx->error_code = EIO;
-            snprintf(ctx->message, sizeof(ctx->message), "Windows USB creation failed");
+            if (ctx->message[0] == '\0') {
+                snprintf(ctx->message, sizeof(ctx->message), "Windows USB creation failed");
+            }
             pthread_mutex_unlock(&app.mutex);
             log_message("ERROR", "Windows USB creation failed");
         }
@@ -2367,18 +2588,23 @@ void *write_thread(void *arg) {
     snprintf(ctx->message, sizeof(ctx->message), "Unmounting device...");
     pthread_mutex_unlock(&app.mutex);
     
+#if defined(__linux__)
+    unmount_device_linux_deep(device_path);
+#else
     unmount_device(device_path);
+#endif
     
-    src_fd = open(image_path, O_RDONLY);
+    src_fd = open_image_reader(image_path, image_type, &src_pid, &src_mode);
     if (src_fd < 0) {
         pthread_mutex_lock(&app.mutex);
         ctx->state = STATE_ERROR;
         ctx->error_code = errno;
-        snprintf(ctx->message, sizeof(ctx->message), "Failed to open image: %s", strerror(errno));
+        snprintf(ctx->message, sizeof(ctx->message), "Failed to open image reader: %s", strerror(errno));
         pthread_mutex_unlock(&app.mutex);
-        log_message("ERROR", "Failed to open image: %s", strerror(errno));
+        log_message("ERROR", "Failed to open image reader: %s", strerror(errno));
         goto cleanup;
     }
+    log_message("INFO", "Image read mode: %s", src_mode);
     
     int flags = O_WRONLY;
 #ifdef O_SYNC
@@ -2398,6 +2624,7 @@ void *write_thread(void *arg) {
         ctx->error_code = errno;
         snprintf(ctx->message, sizeof(ctx->message), "Failed to open device: %s", strerror(errno));
         pthread_mutex_unlock(&app.mutex);
+        write_status_snapshot(ctx);
         log_message("ERROR", "Failed to open device: %s", strerror(errno));
         goto cleanup;
     }
@@ -2407,6 +2634,7 @@ void *write_thread(void *arg) {
     ctx->start_time = time(NULL);
     ctx->bytes_written = 0;
     pthread_mutex_unlock(&app.mutex);
+    write_status_snapshot(ctx);
     
     log_message("INFO", "Writing %lu bytes", (unsigned long)ctx->bytes_total);
     
@@ -2420,6 +2648,7 @@ void *write_thread(void *arg) {
             ctx->error_code = errno;
             snprintf(ctx->message, sizeof(ctx->message), "Read error: %s", strerror(errno));
             pthread_mutex_unlock(&app.mutex);
+            write_status_snapshot(ctx);
             log_message("ERROR", "Read error: %s", strerror(errno));
             goto cleanup;
         }
@@ -2438,6 +2667,7 @@ void *write_thread(void *arg) {
                 ctx->error_code = errno;
                 snprintf(ctx->message, sizeof(ctx->message), "Write error: %s", strerror(errno));
                 pthread_mutex_unlock(&app.mutex);
+                write_status_snapshot(ctx);
                 log_message("ERROR", "Write error: %s", strerror(errno));
                 goto cleanup;
             }
@@ -2447,35 +2677,69 @@ void *write_thread(void *arg) {
         
         pthread_mutex_lock(&app.mutex);
         ctx->bytes_written += (uint64_t)bytes_read;
-        ctx->progress = (double)ctx->bytes_written / (double)ctx->bytes_total * 100.0;
+        if (!compressed && ctx->bytes_total > 0) {
+            ctx->progress = (double)ctx->bytes_written / (double)ctx->bytes_total * 100.0;
+        }
         
         time_t elapsed = time(NULL) - ctx->start_time;
         if (elapsed > 0) {
             ctx->speed = (double)ctx->bytes_written / (double)elapsed;
-            uint64_t remaining = ctx->bytes_total - ctx->bytes_written;
-            ctx->eta = (time_t)((double)remaining / ctx->speed);
+            if (!compressed && ctx->bytes_total >= ctx->bytes_written && ctx->speed > 0.0) {
+                uint64_t remaining = ctx->bytes_total - ctx->bytes_written;
+                ctx->eta = (time_t)((double)remaining / ctx->speed);
+            } else {
+                ctx->eta = 0;
+            }
         }
         
         char size_buf[32], total_buf[32];
         format_size(ctx->bytes_written, size_buf, sizeof(size_buf));
         format_size(ctx->bytes_total, total_buf, sizeof(total_buf));
-        snprintf(ctx->message, sizeof(ctx->message), "Writing: %s / %s", size_buf, total_buf);
+        if (compressed) {
+            snprintf(ctx->message, sizeof(ctx->message), "Writing decompressed: %s", size_buf);
+        } else {
+            snprintf(ctx->message, sizeof(ctx->message), "Writing: %s / %s", size_buf, total_buf);
+        }
         pthread_mutex_unlock(&app.mutex);
+        write_status_snapshot(ctx);
     }
-    
+
     if (ctx->cancelled) {
+        if (src_fd >= 0) close(src_fd);
+        if (src_pid > 0) {
+            int status = 0;
+            while (waitpid(src_pid, &status, 0) < 0 && errno == EINTR) {}
+        }
+        src_fd = -1;
+        src_pid = -1;
         pthread_mutex_lock(&app.mutex);
         ctx->state = STATE_CANCELLED;
         snprintf(ctx->message, sizeof(ctx->message), "Cancelled by user");
         pthread_mutex_unlock(&app.mutex);
+        write_status_snapshot(ctx);
         log_message("INFO", "Write cancelled by user");
         goto cleanup;
     }
+
+    if (close_image_reader(src_fd, src_pid, src_mode) != 0) {
+        src_fd = -1;
+        src_pid = -1;
+        pthread_mutex_lock(&app.mutex);
+        ctx->state = STATE_ERROR;
+        ctx->error_code = EIO;
+        snprintf(ctx->message, sizeof(ctx->message), "Image decompression/read failed");
+        pthread_mutex_unlock(&app.mutex);
+        write_status_snapshot(ctx);
+        goto cleanup;
+    }
+    src_fd = -1;
+    src_pid = -1;
     
     pthread_mutex_lock(&app.mutex);
     ctx->state = STATE_SYNCING;
     snprintf(ctx->message, sizeof(ctx->message), "Syncing to disk...");
     pthread_mutex_unlock(&app.mutex);
+    write_status_snapshot(ctx);
     
     log_message("INFO", "Syncing data to disk");
     
@@ -2492,11 +2756,22 @@ void *write_thread(void *arg) {
         ctx->state = STATE_VERIFYING;
         snprintf(ctx->message, sizeof(ctx->message), "Verifying...");
         pthread_mutex_unlock(&app.mutex);
+        write_status_snapshot(ctx);
         
         log_message("INFO", "Verifying written data");
         
-        lseek(src_fd, 0, SEEK_SET);
         close(dst_fd);
+
+        src_fd = open_image_reader(image_path, image_type, &src_pid, &src_mode);
+        if (src_fd < 0) {
+            pthread_mutex_lock(&app.mutex);
+            ctx->state = STATE_ERROR;
+            ctx->error_code = errno;
+            snprintf(ctx->message, sizeof(ctx->message), "Failed to reopen image for verification");
+            pthread_mutex_unlock(&app.mutex);
+            write_status_snapshot(ctx);
+            goto cleanup;
+        }
         
         dst_fd = open(device_path, O_RDONLY);
         if (dst_fd < 0) {
@@ -2505,6 +2780,7 @@ void *write_thread(void *arg) {
             ctx->error_code = errno;
             snprintf(ctx->message, sizeof(ctx->message), "Failed to reopen device for verification");
             pthread_mutex_unlock(&app.mutex);
+            write_status_snapshot(ctx);
             goto cleanup;
         }
         
@@ -2515,6 +2791,7 @@ void *write_thread(void *arg) {
             ctx->error_code = ENOMEM;
             snprintf(ctx->message, sizeof(ctx->message), "Memory allocation failed");
             pthread_mutex_unlock(&app.mutex);
+            write_status_snapshot(ctx);
             goto cleanup;
         }
         
@@ -2523,7 +2800,12 @@ void *write_thread(void *arg) {
         
         while (!ctx->cancelled && !verify_failed) {
             ssize_t src_read = read(src_fd, buffer, ctx->block_size);
-            if (src_read <= 0) break;
+            if (src_read < 0) {
+                if (errno == EINTR) continue;
+                verify_failed = 1;
+                break;
+            }
+            if (src_read == 0) break;
             
             ssize_t dst_read = read(dst_fd, verify_buffer, (size_t)src_read);
             if (dst_read != src_read) {
@@ -2539,10 +2821,45 @@ void *write_thread(void *arg) {
             verified += (uint64_t)src_read;
             
             pthread_mutex_lock(&app.mutex);
-            ctx->progress = (double)verified / (double)ctx->bytes_total * 100.0;
-            snprintf(ctx->message, sizeof(ctx->message), "Verifying: %.1f%%", ctx->progress);
+            if (compressed) {
+                ctx->progress = 0.0;
+                char verified_buf[32];
+                format_size(verified, verified_buf, sizeof(verified_buf));
+                snprintf(ctx->message, sizeof(ctx->message), "Verifying decompressed: %s", verified_buf);
+            } else if (ctx->bytes_total > 0) {
+                ctx->progress = (double)verified / (double)ctx->bytes_total * 100.0;
+                snprintf(ctx->message, sizeof(ctx->message), "Verifying: %.1f%%", ctx->progress);
+            } else {
+                snprintf(ctx->message, sizeof(ctx->message), "Verifying...");
+            }
             pthread_mutex_unlock(&app.mutex);
+            write_status_snapshot(ctx);
         }
+
+        if (ctx->cancelled) {
+            if (src_fd >= 0) close(src_fd);
+            if (src_pid > 0) {
+                int status = 0;
+                while (waitpid(src_pid, &status, 0) < 0 && errno == EINTR) {}
+            }
+            src_fd = -1;
+            src_pid = -1;
+            free(verify_buffer);
+            pthread_mutex_lock(&app.mutex);
+            ctx->state = STATE_CANCELLED;
+            snprintf(ctx->message, sizeof(ctx->message), "Cancelled by user");
+            pthread_mutex_unlock(&app.mutex);
+            write_status_snapshot(ctx);
+            goto cleanup;
+        }
+
+        if (close_image_reader(src_fd, src_pid, src_mode) != 0) {
+            src_fd = -1;
+            src_pid = -1;
+            verify_failed = 1;
+        }
+        src_fd = -1;
+        src_pid = -1;
         
         free(verify_buffer);
         
@@ -2552,6 +2869,7 @@ void *write_thread(void *arg) {
             ctx->error_code = EIO;
             snprintf(ctx->message, sizeof(ctx->message), "Verification failed!");
             pthread_mutex_unlock(&app.mutex);
+            write_status_snapshot(ctx);
             log_message("ERROR", "Verification failed");
             goto cleanup;
         }
@@ -2564,12 +2882,14 @@ void *write_thread(void *arg) {
     ctx->progress = 100.0;
     snprintf(ctx->message, sizeof(ctx->message), "Complete!");
     pthread_mutex_unlock(&app.mutex);
+    write_status_snapshot(ctx);
     
     if (ctx->make_bootable && ctx->mode != WRITE_MODE_WINDOWS) {
         pthread_mutex_lock(&app.mutex);
         ctx->state = STATE_PREPARING;
         snprintf(ctx->message, sizeof(ctx->message), "Setting up bootable...");
         pthread_mutex_unlock(&app.mutex);
+        write_status_snapshot(ctx);
 
         setup_windows_boot(device_path, ctx->partition_scheme);
     }
@@ -2578,7 +2898,7 @@ void *write_thread(void *arg) {
     
 cleanup:
     if (buffer) free(buffer);
-    if (src_fd >= 0) close(src_fd);
+    if (src_fd >= 0) close_image_reader(src_fd, src_pid, src_mode);
     if (dst_fd >= 0) close(dst_fd);
     
     sync();
@@ -2605,7 +2925,7 @@ void update_device_list(void) {
     for (int i = 0; i < app.device_count; i++) {
         device_t *dev = &app.devices[i];
         char size_str[32];
-        char display[512];
+        char display[MAX_PATH_LEN + 512];
         
         format_size(dev->size, size_str, sizeof(size_str));
         
@@ -2680,14 +3000,13 @@ void on_browse_clicked(GtkButton *button, gpointer user_data) {
         
         app.image.type = detect_image_type(filename);
         app.image.compressed = is_compressed_image(app.image.type);
-        app.image.is_windows = is_windows_image(filename);
+        app.image.is_windows = 0;
         
         char display[MAX_PATH_LEN + 128];
         char size_str[32];
         format_size(app.image.size, size_str, sizeof(size_str));
-        snprintf(display, sizeof(display), "%s (%s, %s%s)", 
-                 app.image.name, size_str, get_image_type_name(app.image.type),
-                 app.image.is_windows ? ", Windows installer mode" : "");
+        snprintf(display, sizeof(display), "%s (%s, %s)", 
+                 app.image.name, size_str, get_image_type_name(app.image.type));
         
         gtk_entry_set_text(GTK_ENTRY(app.image_entry), display);
         
@@ -2786,85 +3105,231 @@ gboolean update_progress(gpointer user_data) {
     return G_SOURCE_CONTINUE;
 }
 
-static int try_pkexec(const char *exe_path, const char *action_id) {
-    char cmd[1024];
-    if (action_id) {
-        snprintf(cmd, sizeof(cmd), "pkexec --action-id %s %s --sudo-mode", exe_path, action_id);
-    } else {
-        snprintf(cmd, sizeof(cmd), "pkexec %s --sudo-mode", exe_path);
+static int get_current_executable_path(char *out, size_t out_len) {
+    ssize_t len = readlink("/proc/self/exe", out, out_len - 1);
+    if (len > 0) {
+        out[len] = '\0';
+        return 0;
     }
-    return system(cmd);
+
+    if (app_exe_path[0]) {
+        snprintf(out, out_len, "%s", app_exe_path);
+        return 0;
+    }
+
+    return -1;
 }
 
-static int try_gksu(const char *exe_path) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "gksu %s --sudo-mode", exe_path);
-    return system(cmd);
+static int find_program_path(const char *program, char *out, size_t out_len) {
+    const char *path_env = getenv("PATH");
+    if (path_env && *path_env) {
+        char *copy = strdup(path_env);
+        if (copy) {
+            char *save = NULL;
+            for (char *dir = strtok_r(copy, ":", &save); dir; dir = strtok_r(NULL, ":", &save)) {
+                snprintf(out, out_len, "%s/%s", dir, program);
+                if (access(out, X_OK) == 0) {
+                    free(copy);
+                    return 0;
+                }
+            }
+            free(copy);
+        }
+    }
+
+    const char *dirs[] = {"/usr/bin", "/bin", "/usr/local/bin", "/usr/host/bin", "/opt/bin", NULL};
+    for (int i = 0; dirs[i]; i++) {
+        snprintf(out, out_len, "%s/%s", dirs[i], program);
+        if (access(out, X_OK) == 0) return 0;
+    }
+
+    out[0] = '\0';
+    return -1;
 }
 
-static int try_kdesu(const char *exe_path) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "kdesu -c %s --sudo-mode", exe_path);
-    return system(cmd);
+static gboolean privileged_status_poll(gpointer user_data) {
+    privileged_write_job_t *job = (privileged_write_job_t *)user_data;
+    FILE *f = fopen(job->status_file, "r");
+    if (!f) {
+        if (time(NULL) - job->start_time > 15) {
+            gtk_label_set_text(GTK_LABEL(app.status_label), "Waiting for administrator authentication or privileged writer startup...");
+            gtk_progress_bar_pulse(GTK_PROGRESS_BAR(app.progress_bar));
+        }
+        return G_SOURCE_CONTINUE;
+    }
+
+    double progress = 0.0;
+    unsigned long bytes_written = 0;
+    unsigned long bytes_total = 0;
+    double speed = 0.0;
+    long eta = 0;
+    int state = 0;
+    char message[512] = "";
+
+    int ok = fscanf(f, "%lf\n%lu\n%lu\n%lf\n%ld\n%d\n",
+                    &progress, &bytes_written, &bytes_total, &speed, &eta, &state) == 6;
+    if (ok && fgets(message, sizeof(message), f)) {
+        message[strcspn(message, "\r\n")] = '\0';
+    }
+    fclose(f);
+
+    if (!ok) return G_SOURCE_CONTINUE;
+    job->status_seen = 1;
+
+    if (message[0]) {
+        gtk_label_set_text(GTK_LABEL(app.status_label), message);
+        gtk_progress_bar_set_text(GTK_PROGRESS_BAR(app.progress_bar), message);
+    }
+
+    if (bytes_total > 0 || progress > 0.0) {
+        double fraction = progress / 100.0;
+        if (fraction < 0.0) fraction = 0.0;
+        if (fraction > 1.0) fraction = 1.0;
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(app.progress_bar), fraction);
+    } else {
+        gtk_progress_bar_pulse(GTK_PROGRESS_BAR(app.progress_bar));
+    }
+
+    if (speed > 0.0) {
+        char speed_buf[32];
+        format_speed(speed, speed_buf, sizeof(speed_buf));
+        gtk_label_set_text(GTK_LABEL(app.speed_label), speed_buf);
+    }
+
+    if (eta > 0) {
+        char eta_buf[32];
+        format_time((time_t)eta, eta_buf, sizeof(eta_buf));
+        gtk_label_set_text(GTK_LABEL(app.eta_label), eta_buf);
+    }
+
+    return G_SOURCE_CONTINUE;
 }
 
-static int run_with_sudo(const char *args[]) {
+static int run_privileged_cli_write(privileged_write_job_t *job) {
     char exe_path[MAX_PATH_LEN];
-    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-    if (len <= 0) return 0;
-    exe_path[len] = '\0';
+    char pkexec_path[MAX_PATH_LEN];
+    char block_size_arg[32];
+    if (get_current_executable_path(exe_path, sizeof(exe_path)) != 0) return -1;
+    if (find_program_path("pkexec", pkexec_path, sizeof(pkexec_path)) != 0) {
+        snprintf(job->last_output, sizeof(job->last_output), "pkexec was not found in PATH or common system locations");
+        return 127;
+    }
+    snprintf(block_size_arg, sizeof(block_size_arg), "%lu", (unsigned long)job->block_size);
 
-    int ret = try_pkexec(exe_path, "com.uniximage.write");
-    if (ret == 0) return 1;
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return -1;
 
-    ret = try_pkexec(exe_path, NULL);
-    if (ret == 0) return 1;
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
 
-    ret = try_gksu(exe_path);
-    if (ret == 0) return 1;
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
 
-    ret = try_kdesu(exe_path);
-    if (ret == 0) return 1;
+        if (job->verify) {
+            char *const argv[] = {
+                pkexec_path, exe_path, "--sudo-mode", "--cli",
+                "-i", job->image_path,
+                "-d", job->device_path,
+                "-b", block_size_arg,
+                "--status-file", job->status_file,
+                "-V", "-y", NULL
+            };
+            execv(pkexec_path, argv);
+        } else {
+            char *const argv[] = {
+                pkexec_path, exe_path, "--sudo-mode", "--cli",
+                "-i", job->image_path,
+                "-d", job->device_path,
+                "-b", block_size_arg,
+                "--status-file", job->status_file,
+                "-y", NULL
+            };
+            execv(pkexec_path, argv);
+        }
+        _exit(127);
+    }
 
-    return 0;
+    close(pipefd[1]);
+
+        for (;;) {
+            char buf[512];
+            ssize_t n = read(pipefd[0], buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+
+        if (!job->started) job->started = 1;
+        size_t copy_len = (size_t)n;
+        size_t cur_len = strlen(job->last_output);
+        if (cur_len + copy_len >= sizeof(job->last_output)) {
+            size_t drop = cur_len + copy_len - sizeof(job->last_output) + 1;
+            memmove(job->last_output, job->last_output + drop, cur_len - drop + 1);
+            cur_len = strlen(job->last_output);
+        }
+        memcpy(job->last_output + cur_len, buf, copy_len);
+        job->last_output[cur_len + copy_len] = '\0';
+    }
+
+    close(pipefd[0]);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        return -1;
+    }
+
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
+}
+
+static gboolean privileged_write_finished(gpointer user_data) {
+    privileged_write_job_t *job = (privileged_write_job_t *)user_data;
+
+    if (job->poll_id) {
+        g_source_remove(job->poll_id);
+        job->poll_id = 0;
+    }
+
+    gtk_widget_set_sensitive(app.write_button, TRUE);
+    gtk_widget_set_sensitive(app.cancel_button, FALSE);
+    gtk_label_set_text(GTK_LABEL(app.status_label), job->result == 0 ? "Privileged write complete" : "Privileged write failed");
+    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(app.progress_bar), job->result == 0 ? "Complete" : "Failed");
+
+    GtkWidget *dialog = gtk_message_dialog_new(
+        GTK_WINDOW(app.window),
+        GTK_DIALOG_MODAL,
+        job->result == 0 ? GTK_MESSAGE_INFO : GTK_MESSAGE_ERROR,
+        GTK_BUTTONS_OK,
+        job->result == 0 ? "Image write completed successfully."
+                         : "Authentication or privileged write failed. pkexec is required for GUI writes. Last output: %s",
+        job->last_output[0] ? job->last_output : "no output");
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+
+    if (job->status_file[0]) unlink(job->status_file);
+    free(job);
+    return G_SOURCE_REMOVE;
+}
+
+static void *privileged_write_thread(void *arg) {
+    privileged_write_job_t *job = (privileged_write_job_t *)arg;
+    job->result = run_privileged_cli_write(job);
+    g_idle_add(privileged_write_finished, job);
+    return NULL;
 }
 
 void on_write_clicked(GtkButton *button, gpointer user_data) {
     (void)button;
     (void)user_data;
-    
-    if (geteuid() != 0) {
-        char exe_path[MAX_PATH_LEN];
-        ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-        if (len > 0) {
-            exe_path[len] = '\0';
-            const char *args[] = { exe_path, "--sudo-mode", NULL };
-            
-            if (!run_with_sudo(args)) {
-                GtkWidget *dialog = gtk_message_dialog_new(
-                    GTK_WINDOW(app.window),
-                    GTK_DIALOG_MODAL,
-                    GTK_MESSAGE_ERROR,
-                    GTK_BUTTONS_OK,
-                    "Failed to authenticate. Please run with sudo manually.");
-                gtk_dialog_run(GTK_DIALOG(dialog));
-                gtk_widget_destroy(dialog);
-                return;
-            }
-            gtk_main_quit();
-            return;
-        }
-        
-        GtkWidget *dialog = gtk_message_dialog_new(
-            GTK_WINDOW(app.window),
-            GTK_DIALOG_MODAL,
-            GTK_MESSAGE_ERROR,
-            GTK_BUTTONS_OK,
-            "Please run with sudo manually.");
-        gtk_dialog_run(GTK_DIALOG(dialog));
-        gtk_widget_destroy(dialog);
-        return;
-    }
     
     if (strlen(app.image.path) == 0) {
         GtkWidget *dialog = gtk_message_dialog_new(
@@ -2902,7 +3367,7 @@ void on_write_clicked(GtkButton *button, gpointer user_data) {
         return;
     }
     
-    char confirm_msg[1024];
+    char confirm_msg[MAX_PATH_LEN * 2 + 512];
     char size_str[32];
     format_size(app.selected_device->size, size_str, sizeof(size_str));
     
@@ -2930,7 +3395,7 @@ void on_write_clicked(GtkButton *button, gpointer user_data) {
     }
     
     memset(&app.ctx, 0, sizeof(write_context_t));
-    app.ctx.bytes_total = app.image.size;
+    app.ctx.bytes_total = app.image.compressed ? 0 : app.image.size;
     app.ctx.verify = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app.verify_check));
     app.ctx.sync_writes = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app.sync_check));
     
@@ -2953,6 +3418,71 @@ void on_write_clicked(GtkButton *button, gpointer user_data) {
         else if (strstr(block_size_str, "4 MB")) app.ctx.block_size = 4 * 1024 * 1024;
         else if (strstr(block_size_str, "16 MB")) app.ctx.block_size = 16 * 1024 * 1024;
         g_free(block_size_str);
+    }
+
+    if (geteuid() != 0) {
+        GtkWidget *auth_dialog = gtk_message_dialog_new(
+            GTK_WINDOW(app.window),
+            GTK_DIALOG_MODAL,
+            GTK_MESSAGE_INFO,
+            GTK_BUTTONS_OK,
+            "Administrator privileges are required to write the image. The system authentication prompt will open next.");
+        gtk_dialog_run(GTK_DIALOG(auth_dialog));
+        gtk_widget_destroy(auth_dialog);
+
+        privileged_write_job_t *job = calloc(1, sizeof(privileged_write_job_t));
+        if (!job) {
+            GtkWidget *err_dialog = gtk_message_dialog_new(
+                GTK_WINDOW(app.window), GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR,
+                GTK_BUTTONS_OK, "Memory allocation failed.");
+            gtk_dialog_run(GTK_DIALOG(err_dialog));
+            gtk_widget_destroy(err_dialog);
+            return;
+        }
+
+        snprintf(job->image_path, sizeof(job->image_path), "%s", app.image.path);
+        snprintf(job->device_path, sizeof(job->device_path), "%s", app.selected_device->path);
+        job->verify = app.ctx.verify;
+        job->block_size = app.ctx.block_size;
+
+        char status_template[] = "/tmp/uniximage-status-XXXXXX";
+        int status_fd = mkstemp(status_template);
+        if (status_fd < 0) {
+            free(job);
+            GtkWidget *err_dialog = gtk_message_dialog_new(
+                GTK_WINDOW(app.window), GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR,
+                GTK_BUTTONS_OK, "Failed to create privileged writer status file.");
+            gtk_dialog_run(GTK_DIALOG(err_dialog));
+            gtk_widget_destroy(err_dialog);
+            return;
+        }
+        close(status_fd);
+        snprintf(job->status_file, sizeof(job->status_file), "%s", status_template);
+        unlink(job->status_file);
+        job->start_time = time(NULL);
+
+        gtk_widget_set_sensitive(app.write_button, FALSE);
+        gtk_widget_set_sensitive(app.cancel_button, FALSE);
+        gtk_label_set_text(GTK_LABEL(app.status_label), "Waiting for administrator authentication...");
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(app.progress_bar), 0.0);
+        gtk_progress_bar_pulse(GTK_PROGRESS_BAR(app.progress_bar));
+        gtk_progress_bar_set_text(GTK_PROGRESS_BAR(app.progress_bar), "Waiting for administrator authentication");
+        job->poll_id = g_timeout_add(250, privileged_status_poll, job);
+
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, privileged_write_thread, job) != 0) {
+            if (job->poll_id) g_source_remove(job->poll_id);
+            unlink(job->status_file);
+            free(job);
+            GtkWidget *err_dialog = gtk_message_dialog_new(
+                GTK_WINDOW(app.window), GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR,
+                GTK_BUTTONS_OK, "Failed to start privileged writer.");
+            gtk_dialog_run(GTK_DIALOG(err_dialog));
+            gtk_widget_destroy(err_dialog);
+            return;
+        }
+        pthread_detach(thread);
+        return;
     }
     
     gtk_widget_set_sensitive(app.write_button, FALSE);
@@ -3149,6 +3679,30 @@ void create_gui(void) {
 
 #endif
 
+static int reexec_with_privilege(int argc, char *argv[]) {
+    const char *tools[] = {"sudo", "doas", "pkexec", NULL};
+
+    for (int t = 0; tools[t]; t++) {
+        char **new_argv = calloc((size_t)argc + 3, sizeof(char *));
+        if (!new_argv) return -1;
+
+        int n = 0;
+        new_argv[n++] = (char *)tools[t];
+        for (int i = 0; i < argc; i++) {
+            new_argv[n++] = argv[i];
+        }
+        new_argv[n++] = "--sudo-mode";
+        new_argv[n] = NULL;
+
+        fprintf(stderr, "Administrator privileges are required to write disk images. Trying %s...\n", tools[t]);
+        execvp(tools[t], new_argv);
+        free(new_argv);
+    }
+
+    fprintf(stderr, "Error: writing requires root privileges. Install sudo/doas/pkexec or run as root.\n");
+    return -1;
+}
+
 void print_usage(const char *prog) {
     printf("UnixImage - Universal Disk Image Writer v%s\n", VERSION);
     printf("Usage: %s [options] [image] [device]\n\n", prog);
@@ -3162,6 +3716,7 @@ void print_usage(const char *prog) {
     printf("  -V, --verify      Verify after writing\n");
     printf("  -b, --blocksize N Set block size in bytes\n");
     printf("  -q, --quiet       Quiet mode\n");
+    printf("  --status-file F   Write machine-readable progress to file\n");
 #ifndef CLI_MODE
     printf("  -c, --cli         Force CLI mode\n");
 #endif
@@ -3216,6 +3771,8 @@ int cli_write(const char *image_path, const char *device_path,
     strncpy(app.image.path, image_path, sizeof(app.image.path) - 1);
     app.image.size = (uint64_t)st.st_size;
     app.image.type = detect_image_type(image_path);
+    app.image.compressed = is_compressed_image(app.image.type);
+    app.image.is_windows = is_windows_image(image_path);
     
     int found = 0;
     app.device_count = enumerate_devices(app.devices, MAX_DEVICES);
@@ -3228,6 +3785,10 @@ int cli_write(const char *image_path, const char *device_path,
     }
     
     if (!found) {
+        if (app.device_count >= MAX_DEVICES) {
+            fprintf(stderr, "Error: Device list is full; cannot add manual target: %s\n", device_path);
+            return 1;
+        }
         device_t *manual_dev = &app.devices[app.device_count];
         memset(manual_dev, 0, sizeof(device_t));
         strncpy(manual_dev->path, device_path, sizeof(manual_dev->path) - 1);
@@ -3246,7 +3807,19 @@ int cli_write(const char *image_path, const char *device_path,
     printf("Image:  %s (%s, %s)\n", image_path, img_size, 
            get_image_type_name(app.image.type));
     printf("Device: %s (%s)\n", device_path, dev_size);
+    if (app.image.is_windows) {
+        printf("Mode:   Windows installer USB (partition, FAT32 format, file copy)\n");
+    } else if (app.image.compressed) {
+        printf("Mode:   Decompress while writing (%s)\n", get_image_type_name(app.image.type));
+    } else {
+        printf("Mode:   Raw block image write\n");
+    }
     printf("\n");
+
+    if (!app.image.compressed && !app.image.is_windows && app.image.size > app.selected_device->size) {
+        fprintf(stderr, "Error: Image is larger than target device.\n");
+        return 1;
+    }
     
     if (!skip_confirm) {
         printf("WARNING: All data on %s will be destroyed!\n", device_path);
@@ -3262,14 +3835,20 @@ int cli_write(const char *image_path, const char *device_path,
     }
     
     memset(&app.ctx, 0, sizeof(write_context_t));
-    app.ctx.bytes_total = app.image.size;
+    app.ctx.bytes_total = app.image.compressed ? 0 : app.image.size;
     app.ctx.verify = verify;
     app.ctx.block_size = block_size;
     app.ctx.sync_writes = 1;
     app.running = 1;
+    snprintf(app.ctx.message, sizeof(app.ctx.message), "Starting privileged writer...");
+    write_status_snapshot(&app.ctx);
     
     pthread_t thread;
-    pthread_create(&thread, NULL, write_thread, NULL);
+    if (pthread_create(&thread, NULL, write_thread, NULL) != 0) {
+        fprintf(stderr, "Error: Failed to start write thread.\n");
+        app.running = 0;
+        return 1;
+    }
     
     time_t last_update = 0;
     while (app.running) {
@@ -3283,8 +3862,13 @@ int cli_write(const char *image_path, const char *device_path,
             format_speed(app.ctx.speed, speed, sizeof(speed));
             format_time(app.ctx.eta, eta, sizeof(eta));
             
-            printf("\r[%5.1f%%] %s / %s @ %s ETA: %s    ",
-                   app.ctx.progress, size_written, size_total, speed, eta);
+            if (app.image.compressed) {
+                printf("\r[%s] %s written @ %s    ",
+                       app.ctx.message, size_written, speed);
+            } else {
+                printf("\r[%5.1f%%] %s / %s @ %s ETA: %s    ",
+                       app.ctx.progress, size_written, size_total, speed, eta);
+            }
             fflush(stdout);
             
             pthread_mutex_unlock(&app.mutex);
@@ -3313,6 +3897,9 @@ int main(int argc, char *argv[]) {
     setlocale(LC_ALL, "");
 
     memset(&app, 0, sizeof(app_t));
+    if (argc > 0 && argv[0]) {
+        snprintf(app_exe_path, sizeof(app_exe_path), "%s", argv[0]);
+    }
     pthread_mutex_init(&app.mutex, NULL);
 
     app.os = detect_os();
@@ -3334,6 +3921,7 @@ int main(int argc, char *argv[]) {
     size_t block_size = DEFAULT_BLOCK_SIZE;
     char *image_file = NULL;
     char *device_file = NULL;
+    char *status_file = NULL;
     
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -3350,6 +3938,8 @@ int main(int argc, char *argv[]) {
             skip_confirm = 1;
         } else if (strcmp(argv[i], "--sudo-mode") == 0) {
             app.sudo_mode = 1;
+        } else if (strcmp(argv[i], "--status-file") == 0 && i + 1 < argc) {
+            status_file = argv[++i];
         } else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--verify") == 0) {
             verify = 1;
         } else if ((strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--blocksize") == 0) 
@@ -3388,32 +3978,9 @@ int main(int argc, char *argv[]) {
         cli_mode = 1;
 }
 
-#ifndef CLI_MODE
-    if (!app.is_root && !app.sudo_mode) {
-        char exe_path[MAX_PATH_LEN];
-        ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-        if (len > 0) {
-            exe_path[len] = '\0';
-            fprintf(stderr, "Requesting administrator privileges...\n");
-
-            char cmd[1024];
-            snprintf(cmd, sizeof(cmd),
-                "pkexec --action-id com.uniximage.write "
-                "--message \"UnixImage needs administrator access to write disk images. "
-                "Only the selected target device will be modified.\" "
-                "%s --sudo-mode",
-                exe_path);
-
-            int ret = system(cmd);
-            if (ret == 0) {
-                app.log_file = fopen(LOG_FILE, "a");
-                log_message("INFO", "Authenticated via pkexec");
-            } else {
-                fprintf(stderr, "Authentication cancelled. Device enumeration may be limited.\n");
-            }
-        }
+    if (status_file) {
+        snprintf(status_file_path, sizeof(status_file_path), "%s", status_file);
     }
-#endif
 
     if (cli_mode) {
         if (!image_file || !device_file) {
@@ -3423,8 +3990,10 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         
-        if (!app.is_root) {
-            fprintf(stderr, "Warning: Running without root privileges. Write may fail.\n");
+        if (!app.is_root && !app.sudo_mode) {
+            if (app.log_file) fclose(app.log_file);
+            pthread_mutex_destroy(&app.mutex);
+            return reexec_with_privilege(argc, argv) == 0 ? 0 : 1;
         }
         
         int ret = cli_write(image_file, device_file, verify, skip_confirm, block_size);

@@ -21,9 +21,11 @@ fi
 echo "Compiling CLI version..."
 cc -o uniximage-cli uniximage.c -DCLI_MODE -lpthread
 
+GUI_BUILT=0
 if pkg-config --cflags --libs gtk+-3.0 >/dev/null 2>&1; then
     echo "Compiling GUI version..."
     cc -o uniximage uniximage.c $(pkg-config --cflags --libs gtk+-3.0) -lpthread
+    GUI_BUILT=1
 else
     echo "Warning: GTK3 not found, GUI version not compiled"
     echo "To compile GUI, install GTK3 development packages"
@@ -36,7 +38,11 @@ mkdir -p "$ICON_DIR_128"
 mkdir -p "$ICON_DIR_256"
 mkdir -p "$ICON_DIR/scalable/apps"
 
-install -m755 uniximage "$BIN_DIR/"
+if [ "$GUI_BUILT" -eq 1 ]; then
+    install -m755 uniximage "$BIN_DIR/"
+else
+    install -m755 uniximage-cli "$BIN_DIR/uniximage"
+fi
 install -m755 uniximage-cli "$BIN_DIR/"
 
 install -m644 uniximage.desktop "$DESKTOP_FILE_DIR/"
