@@ -30,6 +30,16 @@
 #include <limits.h>
 #include <locale.h>
 
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#define UI_UNUSED __attribute__((unused))
+#else
+#define UI_UNUSED
+#endif
+
 #ifndef CLI_MODE
 #include <gtk/gtk.h>
 #endif
@@ -80,14 +90,16 @@
 #include <sys/diskio.h>
 #endif
 
-#define VERSION "2.2"
+#define VERSION "2.3.0"
 #define PROGRAM_NAME "UnixImage"
 #define MAX_DEVICES 64
 #define MAX_PATH_LEN 4096
-#define DEFAULT_BLOCK_SIZE (4 * 1024 * 1024)
+#define DEFAULT_BLOCK_SIZE (8 * 1024 * 1024)
 #define MIN_BLOCK_SIZE (512)
 #define MAX_BLOCK_SIZE (64 * 1024 * 1024)
 #define HASH_BLOCK_SIZE (1024 * 1024)
+#define COPY_BLOCK_SIZE (4 * 1024 * 1024)
+#define STATUS_UPDATE_NS 200000000L
 #define LOG_FILE "/tmp/uniximage.log"
 
 typedef enum {
@@ -193,6 +205,8 @@ typedef struct {
     double speed;
     time_t start_time;
     time_t eta;
+    struct timespec mono_start;
+    struct timespec mono_last_status;
     char message[512];
     int error_code;
     int cancelled;
@@ -218,6 +232,8 @@ typedef struct {
     char status_file[MAX_PATH_LEN];
     char last_output[1024];
     int verify;
+    int sync_writes;
+    partition_scheme_t partition_scheme;
     size_t block_size;
     int result;
     int started;
@@ -300,25 +316,19 @@ void log_message(const char *level, const char *fmt, ...) {
 
 static void write_status_snapshot(const write_context_t *ctx) {
     if (!status_file_path[0] || !ctx) return;
-
-    char tmp_path[MAX_PATH_LEN + 64];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%ld", status_file_path, (long)getpid());
-
-    FILE *f = fopen(tmp_path, "w");
-    if (!f) return;
-
+    int fd = open(status_file_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); return; }
     fprintf(f, "%.3f\n", ctx->progress);
-    fprintf(f, "%lu\n", (unsigned long)ctx->bytes_written);
-    fprintf(f, "%lu\n", (unsigned long)ctx->bytes_total);
+    fprintf(f, "%llu\n", (unsigned long long)ctx->bytes_written);
+    fprintf(f, "%llu\n", (unsigned long long)ctx->bytes_total);
     fprintf(f, "%.3f\n", ctx->speed);
     fprintf(f, "%ld\n", (long)ctx->eta);
     fprintf(f, "%d\n", (int)ctx->state);
     fprintf(f, "%s\n", ctx->message);
     fclose(f);
-
-    rename(tmp_path, status_file_path);
 }
-
 const char *get_os_name(os_type_t os) {
     switch (os) {
         case OS_LINUX: return "Linux";
@@ -675,6 +685,72 @@ static int start_decompressor(image_type_t type, const char *path, pid_t *pid_ou
     return pipefd[0];
 }
 
+
+static int program_exists_portable(const char *program) {
+    if (!program || !*program) return 0;
+    if (strchr(program, '/')) return access(program, X_OK) == 0;
+
+    const char *path_env = getenv("PATH");
+    if (!path_env || !*path_env)
+        path_env = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+    char *copy = strdup(path_env);
+    if (!copy) return 0;
+    int found = 0;
+    char *save = NULL;
+    for (char *dir = strtok_r(copy, ":", &save); dir; dir = strtok_r(NULL, ":", &save)) {
+        char candidate[MAX_PATH_LEN];
+        if (snprintf(candidate, sizeof(candidate), "%s/%s", *dir ? dir : ".", program) >= (int)sizeof(candidate))
+            continue;
+        if (access(candidate, X_OK) == 0) { found = 1; break; }
+    }
+    free(copy);
+    return found;
+}
+
+static int run_program_quiet(const char *const argv[]) {
+    if (!argv || !argv[0]) { errno = EINVAL; return -1; }
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int nullfd = open("/dev/null", O_WRONLY);
+        if (nullfd >= 0) { dup2(nullfd, STDERR_FILENO); if (nullfd > STDERR_FILENO) close(nullfd); }
+        execvp(argv[0], (char * const *)argv);
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) { if (errno == EINTR) continue; return -1; }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int valid_target_device_path(const char *path) {
+    struct stat st;
+    if (!path || stat(path, &st) != 0) return 0;
+    /* BSD raw disks are character devices; Linux/macOS commonly expose block devices too. */
+    return S_ISBLK(st.st_mode) || S_ISCHR(st.st_mode);
+}
+
+static double monotonic_elapsed(const struct timespec *start, const struct timespec *end) {
+    return (double)(end->tv_sec - start->tv_sec) +
+           (double)(end->tv_nsec - start->tv_nsec) / 1000000000.0;
+}
+
+static void write_status_snapshot_throttled(write_context_t *ctx, int force) {
+    if (!status_file_path[0] || !ctx) return;
+#ifdef CLOCK_MONOTONIC
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+        long long ns = (long long)(now.tv_sec - ctx->mono_last_status.tv_sec) * 1000000000LL +
+                       (long long)(now.tv_nsec - ctx->mono_last_status.tv_nsec);
+        if (!force && ns >= 0 && ns < STATUS_UPDATE_NS) return;
+        ctx->mono_last_status = now;
+    }
+#else
+    (void)force;
+#endif
+    write_status_snapshot(ctx);
+}
+
 static int wait_for_reader(pid_t pid, const char *what) {
     if (pid <= 0) return 0;
 
@@ -840,25 +916,7 @@ static void set_write_status(write_context_t *ctx, write_state_t state, double p
 }
 
 static int check_tool(const char *tool) {
-    char *path_env = getenv("PATH");
-    if (!path_env || !*path_env) path_env = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-
-    char *copy = strdup(path_env);
-    if (!copy) return 0;
-
-    int found = 0;
-    char *save = NULL;
-    for (char *dir = strtok_r(copy, ":", &save); dir; dir = strtok_r(NULL, ":", &save)) {
-        char candidate[MAX_PATH_LEN];
-        snprintf(candidate, sizeof(candidate), "%s/%s", dir, tool);
-        if (access(candidate, X_OK) == 0) {
-            found = 1;
-            break;
-        }
-    }
-
-    free(copy);
-    return found;
+    return program_exists_portable(tool);
 }
 
 static int check_required_tools(void) {
@@ -1056,48 +1114,47 @@ static int unmount_device_linux_deep(const char *device) {
     FILE *f = setmntent("/proc/self/mounts", "r");
     if (!f) f = setmntent("/proc/mounts", "r");
     if (!f) {
-        log_message("WARNING", "Cannot read mount table, falling back to generic unmount");
-        return unmount_device(device);
+        log_message("ERROR", "Cannot read mount table; refusing unsafe write");
+        return -1;
     }
-
-    typedef struct {
-        char spec[MAX_PATH_LEN];
-        char mountpoint[MAX_PATH_LEN];
-    } mount_entry_t;
-
+    typedef struct { char spec[MAX_PATH_LEN]; char mountpoint[MAX_PATH_LEN]; } mount_entry_t;
     mount_entry_t entries[128];
     int count = 0;
     struct mntent *mnt;
-
     while ((mnt = getmntent(f)) != NULL && count < 128) {
-        if (strcmp(mnt->mnt_fsname, device) == 0 ||
-            is_child_partition_path(device, mnt->mnt_fsname)) {
+        if (strcmp(mnt->mnt_fsname, device) == 0 || is_child_partition_path(device, mnt->mnt_fsname)) {
             snprintf(entries[count].spec, sizeof(entries[count].spec), "%s", mnt->mnt_fsname);
             snprintf(entries[count].mountpoint, sizeof(entries[count].mountpoint), "%s", mnt->mnt_dir);
             count++;
         }
     }
     endmntent(f);
-
+    int failed = 0;
     for (int pass = 0; pass < count; pass++) {
-        int best = -1;
-        size_t best_len = 0;
+        int best = -1; size_t best_len = 0;
         for (int i = 0; i < count; i++) {
             if (!entries[i].mountpoint[0]) continue;
             size_t l = strlen(entries[i].mountpoint);
-            if (l > best_len) {
-                best = i;
-                best_len = l;
-            }
+            if (l > best_len) { best = i; best_len = l; }
         }
         if (best < 0) break;
-
         const char *argv[] = {"umount", entries[best].mountpoint, NULL};
-        run_cmdv(argv);
+        if (run_cmdv(argv) != 0) failed = 1;
         entries[best].mountpoint[0] = '\0';
     }
-
-    return 0;
+    f = setmntent("/proc/self/mounts", "r");
+    if (!f) f = setmntent("/proc/mounts", "r");
+    if (f) {
+        while ((mnt = getmntent(f)) != NULL) {
+            if (strcmp(mnt->mnt_fsname, device) == 0 || is_child_partition_path(device, mnt->mnt_fsname)) {
+                log_message("ERROR", "Target is still mounted at %s", mnt->mnt_dir);
+                failed = 1;
+                break;
+            }
+        }
+        endmntent(f);
+    } else failed = 1;
+    return failed ? -1 : 0;
 }
 
 static int reread_partition_table_linux(const char *device) {
@@ -1108,8 +1165,6 @@ static int reread_partition_table_linux(const char *device) {
     if (check_tool("partprobe")) run_cmdv(partprobe);
     if (check_tool("blockdev")) run_cmdv(blockdev);
     if (check_tool("udevadm")) run_cmdv(udevadm);
-
-    usleep(800000);
     return 0;
 }
 
@@ -1153,9 +1208,8 @@ static int wipe_device_linux(const char *device) {
         }
     }
 
-    fsync(fd);
+    if (fsync(fd) != 0) log_message("WARNING", "Device flush after wipe failed: %s", strerror(errno));
     close(fd);
-    sync();
     return 0;
 }
 
@@ -1185,7 +1239,6 @@ static int create_windows_fat32_partition(const char *device, partition_scheme_t
         run_cmdv(lba);
     }
 
-    sync();
     reread_partition_table_linux(device);
     return wait_for_partition_linux(partition_out);
 }
@@ -1219,7 +1272,7 @@ static int mount_iso_linux(const char *iso_path, char *loop_dev, char *mount_poi
         return -1;
     }
 
-    const char *losetup[] = {"losetup", "-f", "--show", "-r", iso_path, NULL};
+    const char *losetup[] = {"losetup", "--find", "--show", "--read-only", "--nooverlap", iso_path, NULL};
     if (run_cmdv_capture(losetup, loop_dev, MAX_PATH_LEN) != 0 || strncmp(loop_dev, "/dev/", 5) != 0) {
         log_message("ERROR", "Failed to allocate loop device for ISO");
         return -1;
@@ -1260,7 +1313,7 @@ static int mount_partition_linux_rw(const char *partition, const char *mount_poi
         return -1;
     }
 
-    const char *opts = readonly ? "ro" : "rw,sync";
+    const char *opts = readonly ? "ro" : "rw";
     const char *argv[] = {"mount", "-o", opts, partition, mount_point, NULL};
     return run_cmdv(argv);
 }
@@ -1312,7 +1365,7 @@ static int copy_file_stream(const char *src, const char *dst, write_context_t *c
         return -1;
     }
 
-    unsigned char *buf = malloc(1024 * 1024);
+    unsigned char *buf = malloc(COPY_BLOCK_SIZE);
     if (!buf) {
         close(in);
         close(out);
@@ -1326,7 +1379,7 @@ static int copy_file_stream(const char *src, const char *dst, write_context_t *c
             break;
         }
 
-        ssize_t n = read(in, buf, 1024 * 1024);
+        ssize_t n = read(in, buf, COPY_BLOCK_SIZE);
         if (n < 0) {
             if (errno == EINTR) continue;
             log_message("ERROR", "Read failed for %s: %s", src, strerror(errno));
@@ -1354,13 +1407,13 @@ static int copy_file_stream(const char *src, const char *dst, write_context_t *c
             format_size(ctx->bytes_written, copied_buf, sizeof(copied_buf));
             format_size(ctx->bytes_total, total_buf, sizeof(total_buf));
             snprintf(ctx->message, sizeof(ctx->message), "Copying Windows files: %s / %s", copied_buf, total_buf);
-            write_status_snapshot(ctx);
+            write_status_snapshot_throttled(ctx, 0);
         }
 
         if (rc != 0) break;
     }
 
-    fsync(out);
+    /* One final filesystem/device sync is much faster than fsync() on every copied file. */
     free(buf);
     close(in);
     close(out);
@@ -1662,6 +1715,10 @@ static int windows_usb_write(const char *iso_path, const char *device_path, writ
     uint64_t bytes_to_copy = count_bytes_in_dir_excluding(iso_mount, skip_path);
     ctx->bytes_total = bytes_to_copy + (needs_split ? install_size : 0);
     ctx->bytes_written = 0;
+#ifdef CLOCK_MONOTONIC
+    clock_gettime(CLOCK_MONOTONIC, &ctx->mono_start);
+    ctx->mono_last_status = ctx->mono_start;
+#endif
     ctx->files_total = count_files_in_dir(iso_mount);
     ctx->files_copied = 0;
 
@@ -1678,7 +1735,10 @@ static int windows_usb_write(const char *iso_path, const char *device_path, writ
     }
 
     set_write_status(ctx, STATE_UNMOUNTING, 2.0, "Unmounting target USB...");
-    unmount_device_linux_deep(device_path);
+    if (unmount_device_linux_deep(device_path) != 0) {
+        set_write_status(ctx, STATE_ERROR, -1.0, "Could not unmount all target filesystems (device busy)");
+        goto cleanup;
+    }
 
     set_write_status(ctx, STATE_UNMOUNTING, 4.0, "Wiping target USB...");
     if (wipe_device_linux(device_path) != 0) {
@@ -1738,14 +1798,11 @@ static int windows_usb_write(const char *iso_path, const char *device_path, writ
     }
 
     set_write_status(ctx, STATE_SYNCING, 98.0, "Syncing USB...");
-#ifdef SYS_syncfs
     int mount_fd = open(usb_mount, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (mount_fd >= 0) {
-        syncfs(mount_fd);
+        if (syncfs(mount_fd) != 0) log_message("WARNING", "syncfs failed: %s", strerror(errno));
         close(mount_fd);
     }
-#endif
-    sync();
 
     set_write_status(ctx, STATE_VERIFYING, 99.0, "Validating USB contents...");
     if (validate_usb_contents(usb_mount) != 0) {
@@ -1784,76 +1841,16 @@ cleanup:
 
 
 static int setup_windows_boot(const char *device_path, partition_scheme_t scheme) {
-#if defined(__linux__)
-    int fd = open(device_path, O_RDONLY);
-    if (fd < 0) return -1;
-    
-    unsigned char mbr[512];
-    if (read(fd, mbr, 512) != 512) {
-        close(fd);
-        return -1;
-    }
-    close(fd);
-    
-    if (scheme == PARTscheme_GPT || scheme == PARTscheme_AUTO) {
-        uint8_t gpt_header[92];
-        fd = open(device_path, O_RDONLY);
-        if (fd >= 0) {
-            lseek(fd, 512, SEEK_SET);
-            if (read(fd, gpt_header, 92) == 92) {
-                if (gpt_header[0] == 'E' && gpt_header[1] == 'F' && 
-                    gpt_header[2] == 'I' && gpt_header[3] == ' ') {
-                    close(fd);
-                    log_message("INFO", "GPT/UEFI signature detected - already bootable");
-                    return 0;
-                }
-            }
-            close(fd);
-        }
-    }
-    
-    fd = open(device_path, O_WRONLY);
-    if (fd < 0) return -1;
-    
-    if (scheme == PARTscheme_MBR || scheme == PARTscheme_AUTO) {
-        unsigned char bootcode[512];
-        memset(bootcode, 0, 512);
-        bootcode[440] = 0x80;
-        bootcode[441] = 0x00;
-        bootcode[442] = 0x00;
-        bootcode[443] = 0x00;
-        
-        bootcode[444] = 0x00;
-        bootcode[445] = 0xFE;
-        bootcode[446] = 0xFF;
-        bootcode[447] = 0x00;
-        
-        bootcode[448] = 0x00;
-        bootcode[449] = 0x00;
-        bootcode[450] = 0x00;
-        bootcode[451] = 0x00;
-        
-        bootcode[452] = 0x00;
-        bootcode[453] = 0x00;
-        bootcode[454] = 0x00;
-        bootcode[455] = 0x00;
-        
-        bootcode[510] = 0x55;
-        bootcode[511] = 0xAA;
-        
-        lseek(fd, 0, SEEK_SET);
-        write(fd, bootcode, 512);
-        
-        log_message("INFO", "MBR boot signature set (0x55AA)");
-    }
-    
-    close(fd);
-    return 0;
-#else
     (void)device_path;
     (void)scheme;
+    /*
+     * Never synthesize boot code onto an already-written image. A raw bootable image
+     * carries its own partition table/boot sectors, while Windows installer mode builds
+     * the FAT32 installer explicitly. Writing a fabricated 0x55AA sector here corrupts
+     * valid images instead of making them bootable.
+     */
+    log_message("INFO", "Bootability is provided by the source image or Windows installer mode");
     return 0;
-#endif
 }
 
 #if defined(__linux__)
@@ -2021,13 +2018,24 @@ int is_device_removable(const char *path) {
 }
 
 int is_device_readonly(const char *path) {
-    int fd = open(path, O_WRONLY);
-    if (fd < 0) {
-        if (errno == EROFS) return 1;
-        if (errno == EACCES && geteuid() == 0) return 1;
-        return 0;
+#if defined(__linux__)
+    char block_name[128];
+    if (linux_block_name_from_path(path, block_name, sizeof(block_name)) == 0) {
+        char ro_path[512];
+        snprintf(ro_path, sizeof(ro_path), "/sys/block/%s/ro", block_name);
+        uint64_t ro = read_u64_file(ro_path);
+        if (ro != 0) return 1;
     }
-    close(fd);
+#endif
+#ifdef BLKROGET
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        int ro = 0;
+        if (ioctl(fd, BLKROGET, &ro) == 0) { close(fd); return ro != 0; }
+        close(fd);
+    }
+#endif
+    /* Permission denial is not the same thing as hardware/media read-only. */
     return 0;
 }
 
@@ -2445,53 +2453,30 @@ int enumerate_devices(device_t *devices, int max_devices) {
     }
 }
 
-int unmount_device(const char *device) {
-    char cmd[MAX_PATH_LEN + 128];
-    int ret = 0;
-    
+int UI_UNUSED unmount_device(const char *device) {
+    if (!device || !*device) return -1;
     log_message("INFO", "Unmounting device: %s", device);
-    
+
     switch (app.os) {
-        case OS_LINUX:
-            snprintf(cmd, sizeof(cmd), "umount %s* 2>/dev/null", device);
-            ret = system(cmd);
-            snprintf(cmd, sizeof(cmd), "udisksctl unmount -b %s 2>/dev/null", device);
-            system(cmd);
-            break;
-            
-        case OS_MACOS:
-            snprintf(cmd, sizeof(cmd), "diskutil unmountDisk %s 2>/dev/null", device);
-            ret = system(cmd);
-            break;
-            
-        case OS_FREEBSD:
-        case OS_DRAGONFLY:
-        case OS_MIDNIGHTBSD:
-        case OS_HARDENEDBSD:
-        case OS_GHOSTBSD:
-        case OS_TRUEOS:
-        case OS_OPENBSD:
-        case OS_NETBSD:
-            snprintf(cmd, sizeof(cmd), "umount %s 2>/dev/null", device);
-            ret = system(cmd);
-            snprintf(cmd, sizeof(cmd), "umount %s* 2>/dev/null", device);
-            system(cmd);
-            break;
-            
-        case OS_SOLARIS:
-        case OS_ILLUMOS:
-            snprintf(cmd, sizeof(cmd), "umount %s 2>/dev/null", device);
-            ret = system(cmd);
-            break;
-            
-        default:
-            snprintf(cmd, sizeof(cmd), "umount %s 2>/dev/null", device);
-            ret = system(cmd);
-            break;
+        case OS_MACOS: {
+            const char *argv[] = {"diskutil", "unmountDisk", device, NULL};
+            return run_program_quiet(argv);
+        }
+        case OS_LINUX: {
+            /* The deep Linux path handles child partitions. This is only a fallback. */
+            const char *argv[] = {"umount", device, NULL};
+            int rc = run_program_quiet(argv);
+            if (rc != 0 && program_exists_portable("udisksctl")) {
+                const char *uargv[] = {"udisksctl", "unmount", "-b", device, NULL};
+                rc = run_program_quiet(uargv);
+            }
+            return rc;
+        }
+        default: {
+            const char *argv[] = {"umount", device, NULL};
+            return run_program_quiet(argv);
+        }
     }
-    
-    usleep(500000);
-    return ret;
 }
 
 void *write_thread(void *arg) {
@@ -2508,7 +2493,8 @@ void *write_thread(void *arg) {
     image_type_t image_type = app.image.type;
     int compressed = is_compressed_image(image_type);
 
-    int is_windows = is_windows_image(image_path);
+    /* Detection already ran before confirmation; never rescan a large ISO after the user says yes. */
+    int is_windows = app.image.is_windows;
     if (is_windows > 0) {
         log_message("INFO", "Windows ISO detected (confidence: %d)", is_windows);
         ctx->mode = WRITE_MODE_WINDOWS;
@@ -2589,9 +2575,17 @@ void *write_thread(void *arg) {
     pthread_mutex_unlock(&app.mutex);
     
 #if defined(__linux__)
-    unmount_device_linux_deep(device_path);
+    if (unmount_device_linux_deep(device_path) != 0) {
+        pthread_mutex_lock(&app.mutex);
+        ctx->state = STATE_ERROR;
+        ctx->error_code = EBUSY;
+        snprintf(ctx->message, sizeof(ctx->message), "Could not unmount target device (busy)");
+        pthread_mutex_unlock(&app.mutex);
+        goto cleanup;
+    }
 #else
-    unmount_device(device_path);
+    if (unmount_device(device_path) != 0)
+        log_message("WARNING", "Unmount command returned non-zero; open() will still enforce access rules");
 #endif
     
     src_fd = open_image_reader(image_path, image_type, &src_pid, &src_mode);
@@ -2606,17 +2600,15 @@ void *write_thread(void *arg) {
     }
     log_message("INFO", "Image read mode: %s", src_mode);
     
+    /*
+     * Do buffered sequential I/O and issue an explicit flush at the end. O_SYNC makes
+     * every write wait for stable storage and can reduce USB throughput catastrophically.
+     */
     int flags = O_WRONLY;
-#ifdef O_SYNC
-    if (ctx->sync_writes) {
-        flags |= O_SYNC;
-    }
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
 #endif
-    
     dst_fd = open(device_path, flags);
-    if (dst_fd < 0) {
-        dst_fd = open(device_path, O_WRONLY);
-    }
     
     if (dst_fd < 0) {
         pthread_mutex_lock(&app.mutex);
@@ -2632,6 +2624,10 @@ void *write_thread(void *arg) {
     pthread_mutex_lock(&app.mutex);
     ctx->state = STATE_WRITING;
     ctx->start_time = time(NULL);
+#ifdef CLOCK_MONOTONIC
+    clock_gettime(CLOCK_MONOTONIC, &ctx->mono_start);
+    ctx->mono_last_status = ctx->mono_start;
+#endif
     ctx->bytes_written = 0;
     pthread_mutex_unlock(&app.mutex);
     write_status_snapshot(ctx);
@@ -2681,9 +2677,16 @@ void *write_thread(void *arg) {
             ctx->progress = (double)ctx->bytes_written / (double)ctx->bytes_total * 100.0;
         }
         
-        time_t elapsed = time(NULL) - ctx->start_time;
-        if (elapsed > 0) {
-            ctx->speed = (double)ctx->bytes_written / (double)elapsed;
+        double elapsed = 0.0;
+#ifdef CLOCK_MONOTONIC
+        struct timespec mono_now;
+        if (clock_gettime(CLOCK_MONOTONIC, &mono_now) == 0)
+            elapsed = monotonic_elapsed(&ctx->mono_start, &mono_now);
+#else
+        elapsed = difftime(time(NULL), ctx->start_time);
+#endif
+        if (elapsed > 0.001) {
+            ctx->speed = (double)ctx->bytes_written / elapsed;
             if (!compressed && ctx->bytes_total >= ctx->bytes_written && ctx->speed > 0.0) {
                 uint64_t remaining = ctx->bytes_total - ctx->bytes_written;
                 ctx->eta = (time_t)((double)remaining / ctx->speed);
@@ -2701,7 +2704,11 @@ void *write_thread(void *arg) {
             snprintf(ctx->message, sizeof(ctx->message), "Writing: %s / %s", size_buf, total_buf);
         }
         pthread_mutex_unlock(&app.mutex);
-        write_status_snapshot(ctx);
+        if (ctx->sync_writes && (ctx->bytes_written / (256ULL * 1024ULL * 1024ULL)) !=
+                                ((ctx->bytes_written - (uint64_t)bytes_read) / (256ULL * 1024ULL * 1024ULL))) {
+            if (fdatasync(dst_fd) != 0) log_message("WARNING", "Periodic flush failed: %s", strerror(errno));
+        }
+        write_status_snapshot_throttled(ctx, 0);
     }
 
     if (ctx->cancelled) {
@@ -2743,13 +2750,17 @@ void *write_thread(void *arg) {
     
     log_message("INFO", "Syncing data to disk");
     
-    fsync(dst_fd);
+    if (fsync(dst_fd) != 0) {
+        pthread_mutex_lock(&app.mutex);
+        ctx->state = STATE_ERROR; ctx->error_code = errno;
+        snprintf(ctx->message, sizeof(ctx->message), "Final device flush failed: %s", strerror(errno));
+        pthread_mutex_unlock(&app.mutex);
+        goto cleanup;
+    }
     
 #if defined(__linux__)
     ioctl(dst_fd, BLKFLSBUF, 0);
 #endif
-    
-    sync();
     
     if (ctx->verify && !ctx->cancelled) {
         pthread_mutex_lock(&app.mutex);
@@ -2833,7 +2844,7 @@ void *write_thread(void *arg) {
                 snprintf(ctx->message, sizeof(ctx->message), "Verifying...");
             }
             pthread_mutex_unlock(&app.mutex);
-            write_status_snapshot(ctx);
+            write_status_snapshot_throttled(ctx, 0);
         }
 
         if (ctx->cancelled) {
@@ -2900,9 +2911,7 @@ cleanup:
     if (buffer) free(buffer);
     if (src_fd >= 0) close_image_reader(src_fd, src_pid, src_mode);
     if (dst_fd >= 0) close(dst_fd);
-    
-    sync();
-    
+
     pthread_mutex_lock(&app.mutex);
     app.running = 0;
     pthread_mutex_unlock(&app.mutex);
@@ -2969,12 +2978,17 @@ void on_browse_clicked(GtkButton *button, gpointer user_data) {
     gtk_file_filter_add_pattern(filter, "*.raw");
     gtk_file_filter_add_pattern(filter, "*.dmg");
     gtk_file_filter_add_pattern(filter, "*.vhd");
+    gtk_file_filter_add_pattern(filter, "*.vhdx");
     gtk_file_filter_add_pattern(filter, "*.vdi");
     gtk_file_filter_add_pattern(filter, "*.vmdk");
+    gtk_file_filter_add_pattern(filter, "*.qcow");
     gtk_file_filter_add_pattern(filter, "*.qcow2");
     gtk_file_filter_add_pattern(filter, "*.xz");
     gtk_file_filter_add_pattern(filter, "*.gz");
     gtk_file_filter_add_pattern(filter, "*.bz2");
+    gtk_file_filter_add_pattern(filter, "*.zst");
+    gtk_file_filter_add_pattern(filter, "*.lz4");
+    gtk_file_filter_add_pattern(filter, "*.zip");
     gtk_file_filter_add_pattern(filter, "*.wim");
     gtk_file_filter_add_pattern(filter, "*.swm");
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), filter);
@@ -3000,7 +3014,8 @@ void on_browse_clicked(GtkButton *button, gpointer user_data) {
         
         app.image.type = detect_image_type(filename);
         app.image.compressed = is_compressed_image(app.image.type);
-        app.image.is_windows = 0;
+        /* Do the potentially expensive ISO classification now, never after confirmation. */
+        app.image.is_windows = (app.image.type == IMG_ISO) ? is_windows_image(filename) : 0;
         
         char display[MAX_PATH_LEN + 128];
         char size_str[32];
@@ -3159,14 +3174,14 @@ static gboolean privileged_status_poll(gpointer user_data) {
     }
 
     double progress = 0.0;
-    unsigned long bytes_written = 0;
-    unsigned long bytes_total = 0;
+    unsigned long long bytes_written = 0;
+    unsigned long long bytes_total = 0;
     double speed = 0.0;
     long eta = 0;
     int state = 0;
     char message[512] = "";
 
-    int ok = fscanf(f, "%lf\n%lu\n%lu\n%lf\n%ld\n%d\n",
+    int ok = fscanf(f, "%lf\n%llu\n%llu\n%lf\n%ld\n%d\n",
                     &progress, &bytes_written, &bytes_total, &speed, &eta, &state) == 6;
     if (ok && fgets(message, sizeof(message), f)) {
         message[strcspn(message, "\r\n")] = '\0';
@@ -3211,20 +3226,17 @@ static int run_privileged_cli_write(privileged_write_job_t *job) {
     char block_size_arg[32];
     if (get_current_executable_path(exe_path, sizeof(exe_path)) != 0) return -1;
     if (find_program_path("pkexec", pkexec_path, sizeof(pkexec_path)) != 0) {
-        snprintf(job->last_output, sizeof(job->last_output), "pkexec was not found in PATH or common system locations");
+        snprintf(job->last_output, sizeof(job->last_output), "pkexec was not found");
         return 127;
     }
     snprintf(block_size_arg, sizeof(block_size_arg), "%lu", (unsigned long)job->block_size);
+    const char *part = job->partition_scheme == PARTscheme_GPT ? "gpt" :
+                       job->partition_scheme == PARTscheme_MBR ? "mbr" : "auto";
 
     int pipefd[2];
     if (pipe(pipefd) != 0) return -1;
-
     pid_t pid = fork();
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return -1;
-    }
+    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return -1; }
 
     if (pid == 0) {
         close(pipefd[0]);
@@ -3232,63 +3244,49 @@ static int run_privileged_cli_write(privileged_write_job_t *job) {
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
 
-        if (job->verify) {
-            char *const argv[] = {
-                pkexec_path, exe_path, "--sudo-mode", "--cli",
-                "-i", job->image_path,
-                "-d", job->device_path,
-                "-b", block_size_arg,
-                "--status-file", job->status_file,
-                "-V", "-y", NULL
-            };
-            execv(pkexec_path, argv);
-        } else {
-            char *const argv[] = {
-                pkexec_path, exe_path, "--sudo-mode", "--cli",
-                "-i", job->image_path,
-                "-d", job->device_path,
-                "-b", block_size_arg,
-                "--status-file", job->status_file,
-                "-y", NULL
-            };
-            execv(pkexec_path, argv);
-        }
+        char *argv[32];
+        int n = 0;
+        argv[n++] = pkexec_path;
+        argv[n++] = exe_path;
+        argv[n++] = "--sudo-mode";
+        argv[n++] = "--cli";
+        argv[n++] = "-i"; argv[n++] = job->image_path;
+        argv[n++] = "-d"; argv[n++] = job->device_path;
+        argv[n++] = "-b"; argv[n++] = block_size_arg;
+        argv[n++] = "--partition"; argv[n++] = (char *)part;
+        argv[n++] = "--status-file"; argv[n++] = job->status_file;
+        if (job->sync_writes) argv[n++] = "--extra-flush";
+        if (job->verify) argv[n++] = "-V";
+        argv[n++] = "-y";
+        argv[n] = NULL;
+        execv(pkexec_path, argv);
         _exit(127);
     }
 
     close(pipefd[1]);
-
-        for (;;) {
-            char buf[512];
-            ssize_t n = read(pipefd[0], buf, sizeof(buf));
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        if (n == 0) break;
-
-        if (!job->started) job->started = 1;
-        size_t copy_len = (size_t)n;
-        size_t cur_len = strlen(job->last_output);
+    for (;;) {
+        char buf[512];
+        ssize_t nr = read(pipefd[0], buf, sizeof(buf));
+        if (nr < 0) { if (errno == EINTR) continue; break; }
+        if (nr == 0) break;
+        job->started = 1;
+        size_t copy_len = (size_t)nr, cur_len = strlen(job->last_output);
         if (cur_len + copy_len >= sizeof(job->last_output)) {
             size_t drop = cur_len + copy_len - sizeof(job->last_output) + 1;
+            if (drop > cur_len) drop = cur_len;
             memmove(job->last_output, job->last_output + drop, cur_len - drop + 1);
             cur_len = strlen(job->last_output);
+            if (copy_len >= sizeof(job->last_output) - cur_len)
+                copy_len = sizeof(job->last_output) - cur_len - 1;
         }
         memcpy(job->last_output + cur_len, buf, copy_len);
         job->last_output[cur_len + copy_len] = '\0';
     }
-
     close(pipefd[0]);
 
     int status = 0;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno == EINTR) continue;
-        return -1;
-    }
-
-    if (WIFEXITED(status)) return WEXITSTATUS(status);
-    return -1;
+    while (waitpid(pid, &status, 0) < 0) { if (errno == EINTR) continue; return -1; }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
 static gboolean privileged_write_finished(gpointer user_data) {
@@ -3355,6 +3353,25 @@ void on_write_clicked(GtkButton *button, gpointer user_data) {
         return;
     }
     
+    if (!valid_target_device_path(app.selected_device->path)) {
+        GtkWidget *dialog = gtk_message_dialog_new(
+            GTK_WINDOW(app.window), GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
+            "The selected target is not a raw/block device.");
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        return;
+    }
+#if defined(__linux__)
+    if (target_has_critical_mount_linux(app.selected_device->path)) {
+        GtkWidget *dialog = gtk_message_dialog_new(
+            GTK_WINDOW(app.window), GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
+            "Refusing to overwrite a disk containing /, /home, /boot, or /boot/efi.");
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        return;
+    }
+#endif
+
     if (app.selected_device->readonly) {
         GtkWidget *dialog = gtk_message_dialog_new(
             GTK_WINDOW(app.window),
@@ -3416,20 +3433,21 @@ void on_write_clicked(GtkButton *button, gpointer user_data) {
         else if (strstr(block_size_str, "64 KB")) app.ctx.block_size = 64 * 1024;
         else if (strstr(block_size_str, "1 MB")) app.ctx.block_size = 1024 * 1024;
         else if (strstr(block_size_str, "4 MB")) app.ctx.block_size = 4 * 1024 * 1024;
+        else if (strstr(block_size_str, "8 MB")) app.ctx.block_size = 8 * 1024 * 1024;
         else if (strstr(block_size_str, "16 MB")) app.ctx.block_size = 16 * 1024 * 1024;
         g_free(block_size_str);
     }
 
     if (geteuid() != 0) {
-        GtkWidget *auth_dialog = gtk_message_dialog_new(
-            GTK_WINDOW(app.window),
-            GTK_DIALOG_MODAL,
-            GTK_MESSAGE_INFO,
-            GTK_BUTTONS_OK,
-            "Administrator privileges are required to write the image. The system authentication prompt will open next.");
-        gtk_dialog_run(GTK_DIALOG(auth_dialog));
-        gtk_widget_destroy(auth_dialog);
-
+        /* Go directly from destructive-write confirmation to the OS authentication prompt. */
+        if (!program_exists_portable("pkexec")) {
+            GtkWidget *err_dialog = gtk_message_dialog_new(
+                GTK_WINDOW(app.window), GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
+                "pkexec is required for graphical disk writes. Install polkit/pkexec or run UnixImage as root.");
+            gtk_dialog_run(GTK_DIALOG(err_dialog));
+            gtk_widget_destroy(err_dialog);
+            return;
+        }
         privileged_write_job_t *job = calloc(1, sizeof(privileged_write_job_t));
         if (!job) {
             GtkWidget *err_dialog = gtk_message_dialog_new(
@@ -3443,6 +3461,8 @@ void on_write_clicked(GtkButton *button, gpointer user_data) {
         snprintf(job->image_path, sizeof(job->image_path), "%s", app.image.path);
         snprintf(job->device_path, sizeof(job->device_path), "%s", app.selected_device->path);
         job->verify = app.ctx.verify;
+        job->sync_writes = app.ctx.sync_writes;
+        job->partition_scheme = app.ctx.partition_scheme;
         job->block_size = app.ctx.block_size;
 
         char status_template[] = "/tmp/uniximage-status-XXXXXX";
@@ -3458,7 +3478,6 @@ void on_write_clicked(GtkButton *button, gpointer user_data) {
         }
         close(status_fd);
         snprintf(job->status_file, sizeof(job->status_file), "%s", status_template);
-        unlink(job->status_file);
         job->start_time = time(NULL);
 
         gtk_widget_set_sensitive(app.write_button, FALSE);
@@ -3595,8 +3614,8 @@ void create_gui(void) {
     app.verify_check = gtk_check_button_new_with_label("Verify after writing");
     gtk_grid_attach(GTK_GRID(options_grid), app.verify_check, 0, 0, 1, 1);
     
-    app.sync_check = gtk_check_button_new_with_label("Synchronous writes");
-    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app.sync_check), TRUE);
+    app.sync_check = gtk_check_button_new_with_label("Extra flushes (safer, slower)");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(app.sync_check), FALSE);
     gtk_grid_attach(GTK_GRID(options_grid), app.sync_check, 1, 0, 1, 1);
     
     GtkWidget *blocksize_label = gtk_label_new("Block Size:");
@@ -3607,9 +3626,10 @@ void create_gui(void) {
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.blocksize_combo), "4 KB");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.blocksize_combo), "64 KB");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.blocksize_combo), "1 MB");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.blocksize_combo), "4 MB (Default)");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.blocksize_combo), "4 MB");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.blocksize_combo), "8 MB (Default)");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.blocksize_combo), "16 MB");
-    gtk_combo_box_set_active(GTK_COMBO_BOX(app.blocksize_combo), 4);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(app.blocksize_combo), 5);
     gtk_grid_attach(GTK_GRID(options_grid), app.blocksize_combo, 3, 0, 1, 1);
     
     GtkWidget *partition_label = gtk_label_new("Partition:");
@@ -3622,7 +3642,7 @@ void create_gui(void) {
     gtk_combo_box_set_active(GTK_COMBO_BOX(app.partition_combo), 0);
     gtk_grid_attach(GTK_GRID(options_grid), app.partition_combo, 1, 1, 1, 1);
     
-    app.bootable_check = gtk_check_button_new_with_label("Make bootable (Windows)");
+    app.bootable_check = gtk_check_button_new_with_label("Windows bootable mode (automatic for Windows ISO)");
     gtk_grid_attach(GTK_GRID(options_grid), app.bootable_check, 0, 2, 2, 1);
     
     GtkWidget *progress_frame = gtk_frame_new("Progress");
@@ -3683,6 +3703,7 @@ static int reexec_with_privilege(int argc, char *argv[]) {
     const char *tools[] = {"sudo", "doas", "pkexec", NULL};
 
     for (int t = 0; tools[t]; t++) {
+        if (!program_exists_portable(tools[t])) continue;
         char **new_argv = calloc((size_t)argc + 3, sizeof(char *));
         if (!new_argv) return -1;
 
@@ -3715,6 +3736,8 @@ void print_usage(const char *prog) {
     printf("  -y, --yes         Skip confirmation prompt\n");
     printf("  -V, --verify      Verify after writing\n");
     printf("  -b, --blocksize N Set block size in bytes\n");
+    printf("  --partition P     Windows USB partition scheme: auto, mbr, gpt\n");
+    printf("  --extra-flush     Periodically flush while writing (slower)\n");
     printf("  -q, --quiet       Quiet mode\n");
     printf("  --status-file F   Write machine-readable progress to file\n");
 #ifndef CLI_MODE
@@ -3760,19 +3783,25 @@ void list_devices_cli(void) {
     }
 }
 
-int cli_write(const char *image_path, const char *device_path, 
-              int verify, int skip_confirm, size_t block_size) {
+int cli_write(const char *image_path, const char *device_path,
+              int verify, int skip_confirm, size_t block_size,
+              partition_scheme_t partition_scheme, int extra_flush) {
     struct stat st;
     if (stat(image_path, &st) != 0) {
         fprintf(stderr, "Error: Cannot access image file: %s\n", image_path);
         return 1;
     }
     
+    if (!valid_target_device_path(device_path)) {
+        fprintf(stderr, "Error: Target is not a block/raw device: %s\n", device_path);
+        return 1;
+    }
+
     strncpy(app.image.path, image_path, sizeof(app.image.path) - 1);
     app.image.size = (uint64_t)st.st_size;
     app.image.type = detect_image_type(image_path);
     app.image.compressed = is_compressed_image(app.image.type);
-    app.image.is_windows = is_windows_image(image_path);
+    app.image.is_windows = (app.image.type == IMG_ISO) ? is_windows_image(image_path) : 0;
     
     int found = 0;
     app.device_count = enumerate_devices(app.devices, MAX_DEVICES);
@@ -3800,6 +3829,13 @@ int cli_write(const char *image_path, const char *device_path,
         app.selected_device = manual_dev;
     }
     
+#if defined(__linux__)
+    if (target_has_critical_mount_linux(device_path)) {
+        fprintf(stderr, "Error: Refusing to overwrite a disk containing /, /home, /boot, or /boot/efi.\n");
+        return 1;
+    }
+#endif
+
     char img_size[32], dev_size[32];
     format_size(app.image.size, img_size, sizeof(img_size));
     format_size(app.selected_device->size, dev_size, sizeof(dev_size));
@@ -3838,7 +3874,8 @@ int cli_write(const char *image_path, const char *device_path,
     app.ctx.bytes_total = app.image.compressed ? 0 : app.image.size;
     app.ctx.verify = verify;
     app.ctx.block_size = block_size;
-    app.ctx.sync_writes = 1;
+    app.ctx.partition_scheme = partition_scheme;
+    app.ctx.sync_writes = extra_flush;
     app.running = 1;
     snprintf(app.ctx.message, sizeof(app.ctx.message), "Starting privileged writer...");
     write_status_snapshot(&app.ctx);
@@ -3918,6 +3955,8 @@ int main(int argc, char *argv[]) {
     int list_only = 0;
     int skip_confirm = 0;
     int verify = 0;
+    int extra_flush = 0;
+    partition_scheme_t partition_scheme = PARTscheme_AUTO;
     size_t block_size = DEFAULT_BLOCK_SIZE;
     char *image_file = NULL;
     char *device_file = NULL;
@@ -3938,6 +3977,14 @@ int main(int argc, char *argv[]) {
             skip_confirm = 1;
         } else if (strcmp(argv[i], "--sudo-mode") == 0) {
             app.sudo_mode = 1;
+        } else if (strcmp(argv[i], "--extra-flush") == 0) {
+            extra_flush = 1;
+        } else if (strcmp(argv[i], "--partition") == 0 && i + 1 < argc) {
+            const char *pname = argv[++i];
+            if (strcmp(pname, "gpt") == 0) partition_scheme = PARTscheme_GPT;
+            else if (strcmp(pname, "mbr") == 0) partition_scheme = PARTscheme_MBR;
+            else if (strcmp(pname, "auto") == 0) partition_scheme = PARTscheme_AUTO;
+            else { fprintf(stderr, "Invalid partition scheme: %s\n", pname); return 2; }
         } else if (strcmp(argv[i], "--status-file") == 0 && i + 1 < argc) {
             status_file = argv[++i];
         } else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--verify") == 0) {
@@ -3996,7 +4043,8 @@ int main(int argc, char *argv[]) {
             return reexec_with_privilege(argc, argv) == 0 ? 0 : 1;
         }
         
-        int ret = cli_write(image_file, device_file, verify, skip_confirm, block_size);
+        int ret = cli_write(image_file, device_file, verify, skip_confirm, block_size,
+                            partition_scheme, extra_flush);
         if (app.log_file) fclose(app.log_file);
         pthread_mutex_destroy(&app.mutex);
         return ret;
