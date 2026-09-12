@@ -175,12 +175,35 @@ gdk-pixbuf image-loader setup on the system. If gdk-pixbuf's loaders are broken 
 incomplete (for example the SVG loader fails with `Unsupported image format`), GTK3
 aborts with an assertion from `gtkiconhelper.c` and the whole app closes.
 
-Fix the system gdk-pixbuf stack instead:
+Fix the system gdk-pixbuf stack instead. Reinstall the gdk-pixbuf base package and
+the SVG loader (librsvg) of your distribution with real package names:
+
+* Debian / Ubuntu: `sudo apt install --reinstall librsvg2-common libgdk-pixbuf-2.0-0`
+* Fedora / RHEL: `sudo dnf reinstall gdk-pixbuf2 librsvg2` (on Fedora 42+ the SVG
+  loader is a separate `rsvg-pixbuf-loader` package)
+* openSUSE: `sudo zypper install --force gdk-pixbuf gdk-pixbuf-loader-rsvg librsvg`
+* Arch Linux: `sudo pacman -S gdk-pixbuf2 librsvg` (if your mirror tracks the newer
+  loader split, also/use `librsvg-pixbuf-loader`)
+* Gentoo: `sudo emerge -1 x11-libs/gdk-pixbuf gnome-base/librsvg`
+* Alpine: `sudo apk fix gdk-pixbuf librsvg gdk-pixbuf-loaders`
+* Void Linux: `sudo xbps-reconfigure -f gdk-pixbuf librsvg`
+* Slackware: `sudo slackpkg reinstall gdk-pixbuf2 librsvg`
+* CRUX: `sudo prt-get reinstall gdk-pixbuf librsvg`
+* FreeBSD: `sudo pkg install -f gdk-pixbuf2 librsvg2`
+* NetBSD: `sudo pkgin reinstall gdk-pixbuf librsvg`
+* OpenBSD: `doas pkg_add gdk-pixbuf librsvg`
+
+Most package managers run `gdk-pixbuf-query-loaders --update-cache` automatically as
+a package trigger. On systems that do not (e.g. CRUX, or a manual build), run it by
+hand after reinstalling:
 
 ```bash
-prt-get reinstall gdk-pixbuf librsvg           # CRUX
 gdk-pixbuf-query-loaders --update-cache
 ```
+
+If SVG still fails to load after reinstalling, rebuild the cache by hand and make
+sure `libpixbufloader-svg.so` exists under your
+`/usr/lib*/gdk-pixbuf-2.0/*/loaders/` directory.
 
 Notes:
 
