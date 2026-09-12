@@ -154,7 +154,7 @@ cc -o uniximage uniximage.c $(pkg-config --cflags --libs gtk+-3.0) -lpthread
 
 ## Install
 
-The repository includes an install script that builds the CLI version, attempts the GTK GUI build, and installs the binary, desktop file, and icons under `/usr/local` by default.
+The repository includes an install script that builds the CLI version, attempts the GTK GUI build, and installs the binary and desktop file under `/usr/local` by default.
 
 ```bash
 sudo ./install.sh
@@ -165,6 +165,31 @@ To install somewhere else:
 ```bash
 sudo INSTALL_PREFIX=/usr ./install.sh
 ```
+
+## Troubleshooting
+
+### The app closes when clicking "Browse"
+
+The GUI's file chooser is GTK3's built-in `GtkFileChooser`, which needs a working
+gdk-pixbuf image-loader setup on the system. If gdk-pixbuf's loaders are broken or
+incomplete (for example the SVG loader fails with `Unsupported image format`), GTK3
+aborts with an assertion from `gtkiconhelper.c` and the whole app closes.
+
+Fix the system gdk-pixbuf stack instead:
+
+```bash
+prt-get reinstall gdk-pixbuf librsvg           # CRUX
+gdk-pixbuf-query-loaders --update-cache
+```
+
+Notes:
+
+* Zenity is **not** a dependency of this app and does not fix this crash. It only
+  *appears* to work because modern zenity is a GTK4/libadwaita app that renders
+  icons via librsvg directly, bypassing gdk-pixbuf.
+* If your distribution ships a GTK4 version of zenity, it can be used as a plain
+  file-selection tool (`zenity --file-selection`), but the GUI's Browse button
+  still relies on GTK3 and thus on a repaired gdk-pixbuf.
 
 ## Usage
 
