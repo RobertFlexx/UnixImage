@@ -4,11 +4,6 @@ set -e
 
 INSTALL_DIR="${INSTALL_PREFIX:-/usr/local}"
 BIN_DIR="$INSTALL_DIR/bin"
-SHARE_DIR="$INSTALL_DIR/share/applications"
-ICON_DIR="$INSTALL_DIR/share/icons/hicolor"
-ICON_DIR_48="$INSTALL_DIR/share/icons/hicolor/48x48/apps"
-ICON_DIR_128="$INSTALL_DIR/share/icons/hicolor/128x128/apps"
-ICON_DIR_256="$INSTALL_DIR/share/icons/hicolor/256x256/apps"
 DESKTOP_FILE_DIR="$INSTALL_DIR/share/applications"
 
 echo "Installing UnixImage..."
@@ -33,10 +28,6 @@ fi
 
 mkdir -p "$BIN_DIR"
 mkdir -p "$DESKTOP_FILE_DIR"
-mkdir -p "$ICON_DIR_48"
-mkdir -p "$ICON_DIR_128"
-mkdir -p "$ICON_DIR_256"
-mkdir -p "$ICON_DIR/scalable/apps"
 
 if [ "$GUI_BUILT" -eq 1 ]; then
     install -m755 uniximage "$BIN_DIR/"
@@ -45,11 +36,22 @@ else
 fi
 install -m755 uniximage-cli "$BIN_DIR/"
 
-install -m644 uniximage.desktop "$DESKTOP_FILE_DIR/"
-install -m644 uniximage-48.png "$ICON_DIR_48/"
-install -m644 uniximage-128.png "$ICON_DIR_128/"
-install -m644 uniximage.png "$ICON_DIR_256/"
-install -m644 uniximage.svg "$ICON_DIR/scalable/apps/"
+cat > "$DESKTOP_FILE_DIR/uniximage.desktop" <<EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=UnixImage Writer
+GenericName=ISO Image Writer
+Comment=Write ISO images to USB drives
+Exec=$BIN_DIR/uniximage %f
+TryExec=$BIN_DIR/uniximage
+Terminal=false
+Categories=System;DiskUtility;
+MimeType=application/x-iso-image;
+Keywords=usb;iso;burn;write;disk;image;
+StartupNotify=false
+EOF
+chmod 644 "$DESKTOP_FILE_DIR/uniximage.desktop"
 
 update-desktop-database "$DESKTOP_FILE_DIR" 2>/dev/null || true
 
