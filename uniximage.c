@@ -708,6 +708,33 @@ static int program_exists_portable(const char *program) {
     return found;
 }
 
+/* Resolve at startup: /proc/self/exe is not available on most Unix systems. */
+static void remember_executable_path(const char *arg0) {
+    char resolved[MAX_PATH_LEN];
+    if (!arg0 || !*arg0) return;
+    if (strchr(arg0, '/')) {
+        if (realpath(arg0, resolved))
+            snprintf(app_exe_path, sizeof(app_exe_path), "%s", resolved);
+        return;
+    }
+    const char *path = getenv("PATH");
+    if (!path) path = "/usr/local/bin:/usr/bin:/bin";
+    do {
+        const char *end = strchr(path, ':');
+        size_t len = end ? (size_t)(end - path) : strlen(path);
+        char candidate[MAX_PATH_LEN];
+        int n = len ? snprintf(candidate, sizeof(candidate), "%.*s/%s", (int)len, path, arg0)
+                    : snprintf(candidate, sizeof(candidate), "./%s", arg0);
+        if (n > 0 && (size_t)n < sizeof(candidate) &&
+            access(candidate, X_OK) == 0 && realpath(candidate, resolved)) {
+            snprintf(app_exe_path, sizeof(app_exe_path), "%s", resolved);
+            return;
+        }
+        if (!end) break;
+        path = end + 1;
+    } while (1);
+}
+
 static int run_program_quiet(const char *const argv[]) {
     if (!argv || !argv[0]) { errno = EINVAL; return -1; }
     pid_t pid = fork();
@@ -1319,7 +1346,7 @@ static int mount_partition_linux_rw(const char *partition, const char *mount_poi
 }
 
 /* Compatibility wrapper for older code paths. */
-static int __attribute__((unused)) mount_partition_linux(const char *partition, const char *mount_point) {
+static int UI_UNUSED mount_partition_linux(const char *partition, const char *mount_point) {
     return mount_partition_linux_rw(partition, mount_point, 0);
 }
 
@@ -1478,7 +1505,7 @@ static int copy_tree_excluding(const char *src, const char *dst,
 }
 
 /* Compatibility wrapper for older code paths. */
-static int __attribute__((unused)) copy_file_recursive(const char *src, const char *dst, void *ctx) {
+static int UI_UNUSED copy_file_recursive(const char *src, const char *dst, void *ctx) {
     return copy_tree_excluding(src, dst, NULL, (write_context_t *)ctx);
 }
 
@@ -3120,19 +3147,36 @@ gboolean update_progress(gpointer user_data) {
     return G_SOURCE_CONTINUE;
 }
 
-static int get_current_executable_path(char *out, size_t out_len) {
-    ssize_t len = readlink("/proc/self/exe", out, out_len - 1);
-    if (len > 0) {
-        out[len] = '\0';
-        return 0;
+/* This process is launched by sudo -A; stdout belongs only to sudo. */
+static int sudo_askpass(int argc, char **argv) {
+    const char *prompt = argc > 2 ? argv[2] : "Administrator password:";
+    if (!gtk_init_check(NULL, NULL)) {
+        fprintf(stderr, "Cannot open the display for the sudo password prompt.\n");
+        return 1;
     }
-
-    if (app_exe_path[0]) {
-        snprintf(out, out_len, "%s", app_exe_path);
-        return 0;
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(
+        "UnixImage — Administrator authentication", NULL, GTK_DIALOG_MODAL,
+        "_Cancel", GTK_RESPONSE_CANCEL, "_Authenticate", GTK_RESPONSE_OK, NULL);
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    gtk_container_set_border_width(GTK_CONTAINER(content), 12);
+    GtkWidget *label = gtk_label_new(prompt);
+    gtk_box_pack_start(GTK_BOX(content), label, FALSE, FALSE, 6);
+    GtkWidget *entry = gtk_entry_new();
+    gtk_entry_set_visibility(GTK_ENTRY(entry), FALSE);
+    gtk_entry_set_input_purpose(GTK_ENTRY(entry), GTK_INPUT_PURPOSE_PASSWORD);
+    gtk_entry_set_activates_default(GTK_ENTRY(entry), TRUE);
+    gtk_box_pack_start(GTK_BOX(content), entry, FALSE, FALSE, 6);
+    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_OK);
+    gtk_widget_show_all(dialog);
+    gtk_widget_grab_focus(entry);
+    int result = 1;
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        const char *password = gtk_entry_get_text(GTK_ENTRY(entry));
+        if (printf("%s\n", password) >= 0 && fflush(stdout) == 0) result = 0;
     }
-
-    return -1;
+    gtk_entry_set_text(GTK_ENTRY(entry), "");
+    gtk_widget_destroy(dialog);
+    return result;
 }
 
 static int find_program_path(const char *program, char *out, size_t out_len) {
@@ -3220,46 +3264,89 @@ static gboolean privileged_status_poll(gpointer user_data) {
     return G_SOURCE_CONTINUE;
 }
 
+static const char *gui_privilege_tool(void) {
+#if defined(__linux__)
+    if (program_exists_portable("pkexec")) return "pkexec";
+#endif
+    if (program_exists_portable("sudo")) return "sudo";
+    return NULL;
+}
+
 static int run_privileged_cli_write(privileged_write_job_t *job) {
-    char exe_path[MAX_PATH_LEN];
-    char pkexec_path[MAX_PATH_LEN];
+    char tool_path[MAX_PATH_LEN];
     char block_size_arg[32];
-    if (get_current_executable_path(exe_path, sizeof(exe_path)) != 0) return -1;
-    if (find_program_path("pkexec", pkexec_path, sizeof(pkexec_path)) != 0) {
-        snprintf(job->last_output, sizeof(job->last_output), "pkexec was not found");
+    const char *tool = gui_privilege_tool();
+    if (!app_exe_path[0]) {
+        snprintf(job->last_output, sizeof(job->last_output), "Cannot resolve the UnixImage executable path");
+        return -1;
+    }
+    if (!tool || find_program_path(tool, tool_path, sizeof(tool_path)) != 0) {
+        snprintf(job->last_output, sizeof(job->last_output), "Install sudo to authenticate graphical disk writes");
         return 127;
     }
+
+    int result = -1;
+    gchar *helper_dir = NULL, *helper_path = NULL;
+    gchar **env = g_get_environ();
+    int use_sudo = strcmp(tool, "sudo") == 0;
+    if (use_sudo) {
+        /* A private helper handles arbitrary sudo/PAM prompts, with no password
+         * in argv, the environment, a file, or the writer's captured output. */
+        GError *error = NULL;
+        helper_dir = g_dir_make_tmp("uniximage-askpass-XXXXXX", &error);
+        if (!helper_dir) {
+            snprintf(job->last_output, sizeof(job->last_output), "%s", error->message);
+            g_clear_error(&error);
+            goto cleanup;
+        }
+        helper_path = g_build_filename(helper_dir, "askpass", NULL);
+        gchar *quoted_exe = g_shell_quote(app_exe_path);
+        gchar *script = g_strdup_printf("#!/bin/sh\nexec %s --sudo-askpass \"$@\"\n", quoted_exe);
+        g_free(quoted_exe);
+        gboolean written = g_file_set_contents(helper_path, script, -1, &error);
+        g_free(script);
+        if (!written || chmod(helper_path, 0700) != 0) {
+            snprintf(job->last_output, sizeof(job->last_output), "Cannot create sudo helper: %s",
+                     error ? error->message : strerror(errno));
+            g_clear_error(&error);
+            goto cleanup;
+        }
+        env = g_environ_setenv(env, "SUDO_ASKPASS", helper_path, TRUE);
+    }
+
     snprintf(block_size_arg, sizeof(block_size_arg), "%lu", (unsigned long)job->block_size);
     const char *part = job->partition_scheme == PARTscheme_GPT ? "gpt" :
                        job->partition_scheme == PARTscheme_MBR ? "mbr" : "auto";
+    char *argv[32];
+    int n = 0;
+    argv[n++] = tool_path;
+    if (use_sudo) {
+        argv[n++] = "-A";
+        argv[n++] = "--";
+    }
+    argv[n++] = app_exe_path;
+    argv[n++] = "--sudo-mode";
+    argv[n++] = "--cli";
+    argv[n++] = "-i"; argv[n++] = job->image_path;
+    argv[n++] = "-d"; argv[n++] = job->device_path;
+    argv[n++] = "-b"; argv[n++] = block_size_arg;
+    argv[n++] = "--partition"; argv[n++] = (char *)part;
+    argv[n++] = "--status-file"; argv[n++] = job->status_file;
+    if (job->sync_writes) argv[n++] = "--extra-flush";
+    if (job->verify) argv[n++] = "-V";
+    argv[n++] = "-y";
+    argv[n] = NULL;
 
     int pipefd[2];
-    if (pipe(pipefd) != 0) return -1;
+    if (pipe(pipefd) != 0) goto cleanup;
     pid_t pid = fork();
-    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return -1; }
-
+    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); goto cleanup; }
     if (pid == 0) {
         close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        dup2(pipefd[1], STDERR_FILENO);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0 || dup2(pipefd[1], STDERR_FILENO) < 0)
+            _exit(126);
         close(pipefd[1]);
-
-        char *argv[32];
-        int n = 0;
-        argv[n++] = pkexec_path;
-        argv[n++] = exe_path;
-        argv[n++] = "--sudo-mode";
-        argv[n++] = "--cli";
-        argv[n++] = "-i"; argv[n++] = job->image_path;
-        argv[n++] = "-d"; argv[n++] = job->device_path;
-        argv[n++] = "-b"; argv[n++] = block_size_arg;
-        argv[n++] = "--partition"; argv[n++] = (char *)part;
-        argv[n++] = "--status-file"; argv[n++] = job->status_file;
-        if (job->sync_writes) argv[n++] = "--extra-flush";
-        if (job->verify) argv[n++] = "-V";
-        argv[n++] = "-y";
-        argv[n] = NULL;
-        execv(pkexec_path, argv);
+        execve(tool_path, argv, env);
         _exit(127);
     }
 
@@ -3285,8 +3372,15 @@ static int run_privileged_cli_write(privileged_write_job_t *job) {
     close(pipefd[0]);
 
     int status = 0;
-    while (waitpid(pid, &status, 0) < 0) { if (errno == EINTR) continue; return -1; }
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    while (waitpid(pid, &status, 0) < 0) { if (errno == EINTR) continue; goto cleanup; }
+    result = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+cleanup:
+    if (helper_path) unlink(helper_path);
+    if (helper_dir) rmdir(helper_dir);
+    g_free(helper_path);
+    g_free(helper_dir);
+    g_strfreev(env);
+    return result;
 }
 
 static gboolean privileged_write_finished(gpointer user_data) {
@@ -3308,7 +3402,7 @@ static gboolean privileged_write_finished(gpointer user_data) {
         job->result == 0 ? GTK_MESSAGE_INFO : GTK_MESSAGE_ERROR,
         GTK_BUTTONS_OK,
         job->result == 0 ? "Image write completed successfully."
-                         : "Authentication or privileged write failed. pkexec is required for GUI writes. Last output: %s",
+                         : "Authentication or privileged write failed. Last output: %s",
         job->last_output[0] ? job->last_output : "no output");
     gtk_dialog_run(GTK_DIALOG(dialog));
     gtk_widget_destroy(dialog);
@@ -3440,10 +3534,10 @@ void on_write_clicked(GtkButton *button, gpointer user_data) {
 
     if (geteuid() != 0) {
         /* Go directly from destructive-write confirmation to the OS authentication prompt. */
-        if (!program_exists_portable("pkexec")) {
+        if (!gui_privilege_tool()) {
             GtkWidget *err_dialog = gtk_message_dialog_new(
                 GTK_WINDOW(app.window), GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
-                "pkexec is required for graphical disk writes. Install polkit/pkexec or run UnixImage as root.");
+                "Install sudo for graphical disk writes, or run UnixImage as root. Linux also supports polkit/pkexec.");
             gtk_dialog_run(GTK_DIALOG(err_dialog));
             gtk_widget_destroy(err_dialog);
             return;
@@ -3700,7 +3794,15 @@ void create_gui(void) {
 #endif
 
 static int reexec_with_privilege(int argc, char *argv[]) {
-    const char *tools[] = {"sudo", "doas", "pkexec", NULL};
+    const char *tools[] = {"sudo", "doas",
+#if defined(__linux__)
+                           "pkexec",
+#endif
+                           NULL};
+    if (!app_exe_path[0]) {
+        fprintf(stderr, "Error: cannot resolve the UnixImage executable path.\n");
+        return -1;
+    }
 
     for (int t = 0; tools[t]; t++) {
         if (!program_exists_portable(tools[t])) continue;
@@ -3710,7 +3812,7 @@ static int reexec_with_privilege(int argc, char *argv[]) {
         int n = 0;
         new_argv[n++] = (char *)tools[t];
         for (int i = 0; i < argc; i++) {
-            new_argv[n++] = argv[i];
+            new_argv[n++] = i == 0 ? app_exe_path : argv[i];
         }
         new_argv[n++] = "--sudo-mode";
         new_argv[n] = NULL;
@@ -3720,7 +3822,7 @@ static int reexec_with_privilege(int argc, char *argv[]) {
         free(new_argv);
     }
 
-    fprintf(stderr, "Error: writing requires root privileges. Install sudo/doas/pkexec or run as root.\n");
+    fprintf(stderr, "Error: writing requires root privileges. Install sudo/doas or run as root (Linux also supports pkexec).\n");
     return -1;
 }
 
@@ -3933,10 +4035,13 @@ int cli_write(const char *image_path, const char *device_path,
 int main(int argc, char *argv[]) {
     setlocale(LC_ALL, "");
 
+#ifndef CLI_MODE
+    if (argc > 1 && strcmp(argv[1], "--sudo-askpass") == 0)
+        return sudo_askpass(argc, argv);
+#endif
+
     memset(&app, 0, sizeof(app_t));
-    if (argc > 0 && argv[0]) {
-        snprintf(app_exe_path, sizeof(app_exe_path), "%s", argv[0]);
-    }
+    if (argc > 0) remember_executable_path(argv[0]);
     pthread_mutex_init(&app.mutex, NULL);
 
     app.os = detect_os();
@@ -4037,7 +4142,11 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         
-        if (!app.is_root && !app.sudo_mode) {
+        if (!app.is_root && app.sudo_mode) {
+            fprintf(stderr, "Error: authentication did not grant root privileges.\n");
+            return 1;
+        }
+        if (!app.is_root) {
             if (app.log_file) fclose(app.log_file);
             pthread_mutex_destroy(&app.mutex);
             return reexec_with_privilege(argc, argv) == 0 ? 0 : 1;

@@ -85,7 +85,14 @@ It is designed to write disk images to removable media with a GUI when GTK3 is a
 
 GUI mode requires GTK3.
 
-CLI mode only requires a C compiler, libc, and pthreads.
+CLI mode requires a C99 compiler, libc, and pthreads. The installer probes compiler,
+thread, and clock linker flags; older systems may also need librt. GUI builds need
+GTK3 development files and pkg-config (or pkgconf).
+
+Graphical disk writes use sudo with a built-in GTK password dialog on non-Linux
+systems. Linux prefers pkexec when available and otherwise uses sudo. CLI writes
+use sudo or doas (with pkexec as a Linux fallback). The user must be authorized by
+the selected privilege tool; no privilege tool is needed when already root.
 
 ## Building
 
@@ -154,16 +161,49 @@ cc -o uniximage uniximage.c $(pkg-config --cflags --libs gtk+-3.0) -lpthread
 
 ## Install
 
-The repository includes an install script that builds the CLI version, attempts the GTK GUI build, and installs the binary and desktop file under `/usr/local` by default.
+The POSIX `sh` installer builds the CLI and, when GTK3 is available, the GUI.
+Run it from any directory; Bash and GNU build utilities are not required. It
+builds in a private temporary directory, preserving existing binaries in the
+source tree, then installs under `/usr/local`. If the destination needs root
+access, only the installation step runs through sudo (or doas), which can prompt
+in the terminal.
 
-```bash
-sudo ./install.sh
+```sh
+./install.sh
 ```
 
-To install somewhere else:
+A writable prefix needs no root access:
 
-```bash
-sudo INSTALL_PREFIX=/usr ./install.sh
+```sh
+INSTALL_PREFIX="$HOME/.local" ./install.sh
+```
+
+Build controls and package staging:
+
+```sh
+GUI=no ./install.sh                          # CLI only
+GUI=yes ./install.sh                         # require GTK3; fail if unavailable
+CC=clang CFLAGS="-O2" ./install.sh
+INSTALL_PREFIX=/usr DESTDIR="$PWD/stage" ./install.sh
+```
+
+`GUI=auto` is the default. `CC`, `CPPFLAGS`, `CFLAGS`, `LDFLAGS`, `LDLIBS`,
+`PKG_CONFIG`, and `TMPDIR` are honored. Use a compiler wrapper if a compiler path
+or individual flag contains spaces; compiler flag variables are split into shell
+words. `INSTALL_PREFIX` and `DESTDIR` must be absolute paths. On older Unix systems,
+select a compiler with C99 and POSIX interfaces (for example `CC=xlc_r` on AIX).
+The manual build commands above are examples for common GCC/Clang toolchains;
+use the installer to probe flags for other compilers.
+
+The desktop entry runs the CLI in a terminal when GTK3 is unavailable. macOS can
+run the installed CLI or GTK executable directly; this installer does not create
+a native `.app` bundle. Portability of the installer does not change the platform
+status above: experimental device backends still need testing on their native OS.
+
+Regression checks (no root access or disk writes):
+
+```sh
+python3 -m unittest discover -s tests -v
 ```
 
 ## Troubleshooting
@@ -219,7 +259,7 @@ Notes:
 ### GUI
 
 ```bash
-sudo ./uniximage
+./uniximage
 ```
 
 ### CLI
