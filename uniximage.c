@@ -101,7 +101,7 @@
 #include <sys/diskio.h>
 #endif
 
-#define VERSION "2.4.1-crashfix"
+#define VERSION "2.4.2-mountfix"
 #define PROGRAM_NAME "UnixImage"
 #define MAX_DEVICES 64
 #define MAX_PATH_LEN 4096
@@ -1232,72 +1232,172 @@ static int target_has_critical_mount_linux(const char *device) {
     return 0;
 }
 
-static int unmount_device_linux_deep(const char *device) {
-    FILE *f = setmntent("/proc/self/mounts", "r");
-    if (!f) f = setmntent("/proc/mounts", "r");
+/* Linux mountinfo gives st_dev numbers without requiring stat() on every
+ * mountpoint.  In particular, root cannot necessarily stat a user's FUSE
+ * document portal (/run/user/<uid>/doc), and that is not an unsafe target.
+ * See Documentation/filesystems/proc.rst (proc_pid_mountinfo).
+ * Fail closed on malformed mount data or unresolved block relationships. */
+typedef struct {
+    dev_t filesystem_dev;
+    char mountpoint[MAX_PATH_LEN];
+    char source[MAX_PATH_LEN];
+} linux_mountinfo_record_t;
+
+static int linux_unescape_mount_path(const char *in, char *out, size_t capacity) {
+    size_t j = 0;
+    if (!in || !out || capacity == 0) return -1;
+    for (size_t i = 0; in[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '\\') {
+            if (!in[i+1] || !in[i+2] || !in[i+3]) return -1;
+            unsigned char a = (unsigned char)in[i+1];
+            unsigned char b = (unsigned char)in[i+2];
+            unsigned char d = (unsigned char)in[i+3];
+            if (a < '0' || a > '7' || b < '0' || b > '7' || d < '0' || d > '7') return -1;
+            c = (unsigned char)(((a-'0') << 6) | ((b-'0') << 3) | (d-'0'));
+            if (c == '\0') return -1;
+            i += 3;
+        }
+        if (j+1 >= capacity) return -1;
+        out[j++] = (char)c;
+    }
+    out[j] = '\0';
+    return out[0] == '/' ? 0 : -1;
+}
+
+static int linux_parse_mountinfo_record(const char *line, linux_mountinfo_record_t *record) {
+    unsigned int major_num, minor_num;
+    char raw_mount[MAX_PATH_LEN];
+    char raw_source[MAX_PATH_LEN];
+    const char *separator;
+    if (!line || !record) return -1;
+    /* Fields: mount_id parent_id major:minor root mountpoint options ... */
+    if (sscanf(line, "%*u %*u %u:%u %*s %4095s", &major_num, &minor_num, raw_mount) != 3)
+        return -1;
+    separator = strstr(line, " - ");
+    if (!separator || sscanf(separator+3, "%*s %4095s", raw_source) != 1)
+        return -1;
+    if (linux_unescape_mount_path(raw_mount, record->mountpoint,
+                                  sizeof(record->mountpoint)) != 0) return -1;
+    record->filesystem_dev = makedev(major_num, minor_num);
+    /* source can be a virtual name, escaped path, or 'none'; it need not
+     * be a pathname, and is used only as a conservative backup check. */
+    snprintf(record->source, sizeof(record->source), "%s", raw_source);
+    return 0;
+}
+
+static int linux_mount_belongs_to_target(const char *device,
+                                          const linux_mountinfo_record_t *entry) {
+    char sys_path[128];
+    struct stat st;
+    unsigned maj = major(entry->filesystem_dev), min = minor(entry->filesystem_dev);
+    int n = snprintf(sys_path, sizeof(sys_path), "/sys/dev/block/%u:%u", maj, min);
+    if (n < 0 || (size_t)n >= sizeof(sys_path)) return -1;
+    if (stat(sys_path, &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) return -1;
+        return linux_target_contains_dev(device, entry->filesystem_dev);
+    }
+    if (errno != ENOENT) return -1;
+    /* Non-block-backed mounts (including FUSE, tmpfs, procfs) have no
+     * /sys/dev/block entry.  A concrete /dev path matching the target is
+     * a reason to err on the side of treating it as related. */
+    return mount_source_matches_device_linux(device, entry->source);
+}
+
+static int linux_target_mounts(const char *device, char ***names_out, size_t *count_out) {
+    FILE *f;
+    char *line = NULL;
+    size_t line_cap = 0, used = 0, allocated = 0;
+    char **names = NULL;
+    int result = -1;
+    *names_out = NULL;
+    *count_out = 0;
+    f = fopen("/proc/self/mountinfo", "r");
     if (!f) {
-        log_message("ERROR", "Cannot read mount table; refusing unsafe write");
+        log_message("ERROR", "Cannot read /proc/self/mountinfo: %s", strerror(errno));
         return -1;
     }
-    typedef struct { char spec[MAX_PATH_LEN]; char mountpoint[MAX_PATH_LEN]; } mount_entry_t;
-    mount_entry_t entries[128];
-    int count = 0;
-    struct mntent *mnt;
-    while ((mnt = getmntent(f)) != NULL && count < 128) {
-        int belongs = mount_source_matches_device_linux(device, mnt->mnt_fsname);
-        if (!belongs) {
-            struct stat mounted;
-            if (stat(mnt->mnt_dir, &mounted) != 0) {
-                log_message("ERROR", "Cannot stat mounted filesystem %s", mnt->mnt_dir);
-                endmntent(f); return -1;
-            }
-            belongs = linux_target_contains_dev(device, mounted.st_dev);
-            if (belongs < 0) { endmntent(f); return -1; }
+    while (getline(&line, &line_cap, f) != -1) {
+        linux_mountinfo_record_t rec;
+        if (linux_parse_mountinfo_record(line, &rec) != 0) {
+            log_message("ERROR", "Malformed mountinfo entry; refusing unsafe write");
+            goto done;
         }
-        if (belongs) {
-            const char *mp = mnt->mnt_dir;
-            if (!strcmp(mp, "/") || !strcmp(mp, "/home") || !strcmp(mp, "/usr") ||
-                !strcmp(mp, "/var") || !strcmp(mp, "/boot") || !strcmp(mp, "/boot/efi")) {
-                endmntent(f); return -1;
-            }
-            snprintf(entries[count].spec, sizeof(entries[count].spec), "%s", mnt->mnt_fsname);
-            snprintf(entries[count].mountpoint, sizeof(entries[count].mountpoint), "%s", mnt->mnt_dir);
-            count++;
+        int belongs = linux_mount_belongs_to_target(device, &rec);
+        if (belongs < 0) {
+            log_message("ERROR", "Cannot resolve mount relationship: %s", rec.mountpoint);
+            goto done;
         }
+        if (!belongs) continue;
+        if (!strcmp(rec.mountpoint, "/") || !strcmp(rec.mountpoint, "/home") ||
+            !strcmp(rec.mountpoint, "/usr") || !strcmp(rec.mountpoint, "/var") ||
+            !strcmp(rec.mountpoint, "/boot") || !strcmp(rec.mountpoint, "/boot/efi")) {
+            log_message("ERROR", "Refusing to unmount critical system mount: %s", rec.mountpoint);
+            goto done;
+        }
+        if (used == allocated) {
+            if (allocated >= 4096) {
+                log_message("ERROR", "Too many target mounts; refusing unsafe write");
+                goto done;
+            }
+            size_t grown = allocated ? allocated*2 : 16;
+            char **tmp = realloc(names, grown * sizeof(*tmp));
+            if (!tmp) goto done;
+            names = tmp;
+            allocated = grown;
+        }
+        names[used] = strdup(rec.mountpoint);
+        if (!names[used]) goto done;
+        ++used;
     }
-    endmntent(f);
+    if (ferror(f)) {
+        log_message("ERROR", "Failed reading Linux mount table");
+        goto done;
+    }
+    *names_out = names;
+    *count_out = used;
+    names = NULL;
+    used = 0;
+    result = 0;
+done:
+    for (size_t i = 0; i < used; ++i) free(names[i]);
+    free(names);
+    free(line);
+    fclose(f);
+    return result;
+}
+
+static int unmount_device_linux_deep(const char *device) {
+    char **mountpoints = NULL;
+    size_t count = 0;
+    if (linux_target_mounts(device, &mountpoints, &count) != 0) return -1;
     int failed = 0;
-    for (int pass = 0; pass < count; pass++) {
-        int best = -1; size_t best_len = 0;
-        for (int i = 0; i < count; i++) {
-            if (!entries[i].mountpoint[0]) continue;
-            size_t l = strlen(entries[i].mountpoint);
-            if (l > best_len) { best = i; best_len = l; }
+    /* Deepest paths first so nested target mounts do not obstruct parents. */
+    for (size_t n = 0; n < count; ++n) {
+        size_t best = count, length = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (!mountpoints[i]) continue;
+            size_t l = strlen(mountpoints[i]);
+            if (best == count || l > length) { best = i; length = l; }
         }
-        if (best < 0) break;
-        const char *argv[] = {"umount", entries[best].mountpoint, NULL};
-        if (run_cmdv(argv) != 0) failed = 1;
-        entries[best].mountpoint[0] = '\0';
+        if (best == count) break;
+        const char *args[] = {"umount", "--", mountpoints[best], NULL};
+        if (run_cmdv(args) != 0) failed = 1;
+        free(mountpoints[best]);
+        mountpoints[best] = NULL;
     }
-    f = setmntent("/proc/self/mounts", "r");
-    if (!f) f = setmntent("/proc/mounts", "r");
-    if (f) {
-        while ((mnt = getmntent(f)) != NULL) {
-            int belongs = mount_source_matches_device_linux(device, mnt->mnt_fsname);
-            if (!belongs) {
-                struct stat mounted;
-                if (stat(mnt->mnt_dir, &mounted) != 0) { failed = 1; break; }
-                belongs = linux_target_contains_dev(device, mounted.st_dev);
-                if (belongs < 0) { failed = 1; break; }
-            }
-            if (belongs) {
-                log_message("ERROR", "Target is still mounted at %s", mnt->mnt_dir);
-                failed = 1;
-                break;
-            }
-        }
-        endmntent(f);
-    } else failed = 1;
+    free(mountpoints);
+    /* Recheck mountinfo after unmount: preserve the fail-closed behavior
+     * without touching unrelated mountpoints. */
+    mountpoints = NULL;
+    count = 0;
+    if (linux_target_mounts(device, &mountpoints, &count) != 0) return -1;
+    for (size_t i = 0; i < count; ++i) {
+        log_message("ERROR", "Target is still mounted at %s", mountpoints[i]);
+        free(mountpoints[i]);
+        failed = 1;
+    }
+    free(mountpoints);
     return failed ? -1 : 0;
 }
 
