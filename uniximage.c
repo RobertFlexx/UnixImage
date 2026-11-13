@@ -101,7 +101,7 @@
 #include <sys/diskio.h>
 #endif
 
-#define VERSION "2.4.0-hardened"
+#define VERSION "2.4.1-crashfix"
 #define PROGRAM_NAME "UnixImage"
 #define MAX_DEVICES 64
 #define MAX_PATH_LEN 4096
@@ -3725,10 +3725,13 @@ static int run_privileged_cli_write(privileged_write_job_t *job) {
         "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "DYLD_INSERT_LIBRARIES",
         "DYLD_LIBRARY_PATH", "BASH_ENV", "ENV", "PYTHONPATH", "PYTHONHOME", NULL
     };
+    /* g_environ_unsetenv() takes ownership of env and returns the same
+     * allocation after removing entries.  DO NOT g_strfreev(env) inside
+     * this loop: that frees the array still needed on the next iteration
+     * (the v2.4.0 crash observed in run_privileged_cli_write).
+     * Release the final array exactly once at the cleanup label. */
     for (int i = 0; unsafe_env[i]; i++) {
-        gchar **cleaned = g_environ_unsetenv(env, unsafe_env[i]);
-        g_strfreev(env);
-        env = cleaned;
+        env = g_environ_unsetenv(env, unsafe_env[i]);
     }
     int use_sudo = strcmp(tool, "sudo") == 0;
     if (use_sudo) {
