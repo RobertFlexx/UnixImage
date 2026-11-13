@@ -25,13 +25,22 @@
 #include <dirent.h>
 #include <time.h>
 #include <stdint.h>
+#include <stdatomic.h>
+#include <inttypes.h>
 #include <stdarg.h>
 #include <ctype.h>
 #include <limits.h>
+#include <glob.h>
 #include <locale.h>
 
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
+#endif
+
+#ifndef O_NOFOLLOW
+/* Some legacy ports lack this security primitive. Such targets cannot use
+ * privileged status channels; raw device safety remains checked via fstat. */
+#define O_NOFOLLOW 0
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -48,6 +57,7 @@
 #include <sys/mount.h>
 #include <linux/fs.h>
 #include <mntent.h>
+#include <sys/sysmacros.h>
 #endif
 
 #ifdef __APPLE__
@@ -74,6 +84,7 @@
 #include <sys/disklabel.h>
 #include <sys/dkio.h>
 #include <sys/mount.h>
+#include <sys/statvfs.h>
 #endif
 // these below MIGHT work, take it with a grain of salt.
 #ifdef __sun
@@ -90,7 +101,7 @@
 #include <sys/diskio.h>
 #endif
 
-#define VERSION "2.3.0"
+#define VERSION "2.4.0-hardened"
 #define PROGRAM_NAME "UnixImage"
 #define MAX_DEVICES 64
 #define MAX_PATH_LEN 4096
@@ -100,7 +111,7 @@
 #define HASH_BLOCK_SIZE (1024 * 1024)
 #define COPY_BLOCK_SIZE (4 * 1024 * 1024)
 #define STATUS_UPDATE_NS 200000000L
-#define LOG_FILE "/tmp/uniximage.log"
+/* Never open a predictable global temporary file as root. */
 
 typedef enum {
     OS_UNKNOWN = 0,
@@ -209,7 +220,7 @@ typedef struct {
     struct timespec mono_last_status;
     char message[512];
     int error_code;
-    int cancelled;
+    atomic_int cancelled;
     int verify;
     int sync_writes;
     size_t block_size;
@@ -233,6 +244,7 @@ typedef struct {
     char last_output[1024];
     int verify;
     int sync_writes;
+    int windows;
     partition_scheme_t partition_scheme;
     size_t block_size;
     int result;
@@ -252,7 +264,7 @@ typedef struct {
     write_context_t ctx;
     pthread_t write_thread;
     pthread_mutex_t mutex;
-    int running;
+    atomic_int running;
     os_type_t os;
     char os_name[64];
     char os_version[128];
@@ -261,6 +273,9 @@ typedef struct {
     FILE *log_file;
 #ifndef CLI_MODE
     GtkWidget *window;
+    GtkWidget *browse_button;
+    GtkWidget *refresh_button;
+    int devices_probing;
     GtkWidget *image_entry;
     GtkWidget *device_list;
     GtkWidget *progress_bar;
@@ -276,12 +291,17 @@ typedef struct {
     GtkWidget *bootable_check;
     GtkListStore *device_store;
     guint timer_id;
+    uint64_t image_probe_generation;
+    uint64_t device_probe_generation;
+    int image_probing;
 #endif
 } app_t;
 
 static app_t app;
 static char app_exe_path[MAX_PATH_LEN];
 static char status_file_path[MAX_PATH_LEN];
+static int status_fd = -1;
+static int cli_force_windows = 0, cli_force_raw = 0;
 static volatile sig_atomic_t signal_received = 0;
 
 void log_message(const char *level, const char *fmt, ...) {
@@ -291,8 +311,10 @@ void log_message(const char *level, const char *fmt, ...) {
     char timestamp[32];
     
     time(&now);
-    tm_info = localtime(&now);
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+    struct tm tm_buf;
+    tm_info = localtime_r(&now, &tm_buf);
+    if (tm_info) strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+    else snprintf(timestamp, sizeof(timestamp), "unknown-time");
     
     va_start(args, fmt);
     
@@ -314,21 +336,66 @@ void log_message(const char *level, const char *fmt, ...) {
     va_end(args);
 }
 
-static void write_status_snapshot(const write_context_t *ctx) {
-    if (!status_file_path[0] || !ctx) return;
-    int fd = open(status_file_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0) return;
-    FILE *f = fdopen(fd, "w");
-    if (!f) { close(fd); return; }
-    fprintf(f, "%.3f\n", ctx->progress);
-    fprintf(f, "%llu\n", (unsigned long long)ctx->bytes_written);
-    fprintf(f, "%llu\n", (unsigned long long)ctx->bytes_total);
-    fprintf(f, "%.3f\n", ctx->speed);
-    fprintf(f, "%ld\n", (long)ctx->eta);
-    fprintf(f, "%d\n", (int)ctx->state);
-    fprintf(f, "%s\n", ctx->message);
-    fclose(f);
+/* The privileged process accepts *only an already existing* single-link regular
+ * status file belonging to its invoking user. The opened descriptor is retained
+ * for the lifetime of the write, eliminating path swap, symlink and hardlink
+ * clobber attacks during progress reporting. */
+static int open_status_channel(const char *path) {
+    if (!path || path[0] != '/' || !O_NOFOLLOW) { errno = ENOTSUP; return -1; }
+    int flags = O_WRONLY | O_CLOEXEC | O_NONBLOCK;
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    int fd = open(path, flags);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1) {
+        close(fd); errno = EACCES; return -1;
+    }
+    uid_t allowed_uid = getuid();
+    if (geteuid() == 0) {
+        const char *uid_env = getenv("SUDO_UID");
+        if (!uid_env) uid_env = getenv("PKEXEC_UID");
+        if (uid_env && *uid_env) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long long value = strtoull(uid_env, &end, 10);
+            if (errno || !end || *end || value > UINT32_MAX) {
+                close(fd); errno = EACCES; return -1;
+            }
+            allowed_uid = (uid_t)value;
+        }
+    }
+    if (st.st_uid != allowed_uid) { close(fd); errno = EACCES; return -1; }
+    if (ftruncate(fd, 0) != 0) { close(fd); return -1; }
+    return fd;
 }
+
+static void write_status_snapshot(const write_context_t *ctx) {
+    if (status_fd < 0 || !ctx) return;
+    char buf[1200];
+    int len = snprintf(buf, sizeof(buf), "%.3f\n%" PRIu64 "\n%" PRIu64 "\n%.3f\n%ld\n%d\n%s\n",
+                       ctx->progress, ctx->bytes_written, ctx->bytes_total,
+                       ctx->speed, (long)ctx->eta, (int)ctx->state, ctx->message);
+    if (len < 0 || (size_t)len >= sizeof(buf)) return;
+    struct flock lock = {0};
+    lock.l_type = F_WRLCK;
+    lock.l_whence = SEEK_SET;
+    if (fcntl(status_fd, F_SETLKW, &lock) != 0) return;
+    if (lseek(status_fd, 0, SEEK_SET) < 0 || ftruncate(status_fd, 0) != 0) {
+        lock.l_type = F_UNLCK; (void)fcntl(status_fd, F_SETLK, &lock); return;
+    }
+    size_t off = 0;
+    while (off < (size_t)len) {
+        ssize_t n = write(status_fd, buf + off, (size_t)len - off);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        off += (size_t)n;
+    }
+    lock.l_type = F_UNLCK;
+    (void)fcntl(status_fd, F_SETLK, &lock);
+}
+
 const char *get_os_name(os_type_t os) {
     switch (os) {
         case OS_LINUX: return "Linux";
@@ -433,6 +500,7 @@ os_type_t detect_os(void) {
 #endif
 }
 
+static int run_cmdv_capture(const char *const argv[], char *out, size_t out_len);
 void get_os_version(char *buf, size_t len) {
     struct utsname uts;
     
@@ -462,15 +530,10 @@ void get_os_version(char *buf, size_t len) {
         fclose(f);
     }
 #elif defined(__APPLE__)
-    FILE *p = popen("sw_vers -productVersion 2>/dev/null", "r");
-    if (p) {
-        char ver[64] = {0};
-        if (fgets(ver, sizeof(ver), p)) {
-            ver[strcspn(ver, "\n")] = '\0';
-            snprintf(buf, len, "macOS %s", ver);
-        }
-        pclose(p);
-    }
+    char ver[64] = {0};
+    const char *args[] = {"sw_vers", "-productVersion", NULL};
+    if (run_cmdv_capture(args, ver, sizeof(ver)) == 0)
+        snprintf(buf, len, "macOS %s", ver);
 #elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
     if (uname(&uts) == 0) {
         snprintf(buf, len, "%s %s", uts.sysname, uts.release);
@@ -489,7 +552,7 @@ const char *format_size(uint64_t size, char *buf, size_t len) {
     }
     
     if (unit == 0) {
-        snprintf(buf, len, "%lu B", (unsigned long)size);
+        snprintf(buf, len, "%" PRIu64 " B", size);
     } else {
         snprintf(buf, len, "%.2f %s", dsize, units[unit]);
     }
@@ -529,52 +592,46 @@ const char *format_speed(double bytes_per_sec, char *buf, size_t len) {
 }
 
 image_type_t detect_image_type(const char *path) {
+    unsigned char magic[72] = {0};
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return IMG_UNKNOWN;
+    ssize_t n = read(fd, magic, sizeof(magic));
+    close(fd);
+    if (n < 0) return IMG_UNKNOWN;
+    if (n >= 8) {
+        if (magic[0] == 0x1F && magic[1] == 0x8B) return IMG_GZ;
+        if (!memcmp(magic, "\xfd" "7zXZ\0", 6)) return IMG_XZ;
+        if (magic[0] == 'B' && magic[1] == 'Z' && magic[2] == 'h') return IMG_BZ2;
+        if (!memcmp(magic, "\x28\xB5\x2F\xFD", 4)) return IMG_ZSTD;
+        if (!memcmp(magic, "\x04\x22\x4D\x18", 4)) return IMG_LZ4;
+        if (magic[0] == 'P' && magic[1] == 'K') return IMG_ZIP;
+        if (!memcmp(magic, "vhdxfile", 8)) return IMG_VHDX;
+        if (!memcmp(magic, "KDMV", 4)) return IMG_VMDK;
+        if (!memcmp(magic, "QFI\xfb", 4)) return IMG_QCOW2;
+        if (!memcmp(magic, "MSWIM", 5)) return IMG_WIM;
+        if (!memcmp(magic, "WIM\0", 4)) return IMG_WIM;
+        if (n >= 68 && !memcmp(magic + 64, "\x7f\x10\xda\xbe", 4)) return IMG_VDI;
+    }
     const char *ext = strrchr(path, '.');
     if (!ext) return IMG_RAW;
-    
     ext++;
-    
-    if (strcasecmp(ext, "iso") == 0) return IMG_ISO;
-    if (strcasecmp(ext, "img") == 0) return IMG_IMG;
-    if (strcasecmp(ext, "raw") == 0) return IMG_RAW;
-    if (strcasecmp(ext, "dmg") == 0) return IMG_DMG;
-    if (strcasecmp(ext, "vhd") == 0) return IMG_VHD;
-    if (strcasecmp(ext, "vhdx") == 0) return IMG_VHDX;
-    if (strcasecmp(ext, "vdi") == 0) return IMG_VDI;
-    if (strcasecmp(ext, "vmdk") == 0) return IMG_VMDK;
-    if (strcasecmp(ext, "qcow") == 0) return IMG_QCOW;
-    if (strcasecmp(ext, "qcow2") == 0) return IMG_QCOW2;
-    if (strcasecmp(ext, "xz") == 0) return IMG_XZ;
-    if (strcasecmp(ext, "gz") == 0) return IMG_GZ;
-    if (strcasecmp(ext, "bz2") == 0) return IMG_BZ2;
-    if (strcasecmp(ext, "zst") == 0) return IMG_ZSTD;
-    if (strcasecmp(ext, "lz4") == 0) return IMG_LZ4;
-    if (strcasecmp(ext, "zip") == 0) return IMG_ZIP;
-    if (strcasecmp(ext, "wim") == 0) return IMG_WIM;
-    if (strcasecmp(ext, "swm") == 0) return IMG_WIM;
-    
-    unsigned char magic[16];
-    int fd = open(path, O_RDONLY);
-    if (fd >= 0) {
-        ssize_t n = read(fd, magic, sizeof(magic));
-        close(fd);
-        
-        if (n >= 8) {
-            if (magic[0] == 0x1F && magic[1] == 0x8B) return IMG_GZ;
-            if (magic[0] == 0xFD && magic[1] == '7' && magic[2] == 'z') return IMG_XZ;
-            if (magic[0] == 'B' && magic[1] == 'Z' && magic[2] == 'h') return IMG_BZ2;
-            if (magic[0] == 0x28 && magic[1] == 0xB5 && magic[2] == 0x2F) return IMG_ZSTD;
-            if (magic[0] == 0x04 && magic[1] == 0x22 && magic[2] == 0x4D) return IMG_LZ4;
-            if (magic[0] == 'P' && magic[1] == 'K') return IMG_ZIP;
-            if (memcmp(magic, "conectix", 8) == 0) return IMG_VHD;
-            if (memcmp(magic, "vhdxfile", 8) == 0) return IMG_VHDX;
-            if (memcmp(magic, "KDMV", 4) == 0) return IMG_VMDK;
-            if (memcmp(magic, "QFI\xFB", 4) == 0) return IMG_QCOW2;
-            if (n >= 16 && memcmp(magic, "MSWIM", 5) == 0) return IMG_WIM;
-            if (n >= 16 && memcmp(magic, "WIM", 3) == 0 && magic[3] == 0x00) return IMG_WIM;
-        }
-    }
-    
+    if (!strcasecmp(ext, "iso")) return IMG_ISO;
+    if (!strcasecmp(ext, "img")) return IMG_IMG;
+    if (!strcasecmp(ext, "raw")) return IMG_RAW;
+    if (!strcasecmp(ext, "dmg")) return IMG_DMG;
+    if (!strcasecmp(ext, "vhd")) return IMG_VHD;
+    if (!strcasecmp(ext, "vhdx")) return IMG_VHDX;
+    if (!strcasecmp(ext, "vdi")) return IMG_VDI;
+    if (!strcasecmp(ext, "vmdk")) return IMG_VMDK;
+    if (!strcasecmp(ext, "qcow")) return IMG_QCOW;
+    if (!strcasecmp(ext, "qcow2")) return IMG_QCOW2;
+    if (!strcasecmp(ext, "xz")) return IMG_XZ;
+    if (!strcasecmp(ext, "gz")) return IMG_GZ;
+    if (!strcasecmp(ext, "bz2")) return IMG_BZ2;
+    if (!strcasecmp(ext, "zst")) return IMG_ZSTD;
+    if (!strcasecmp(ext, "lz4")) return IMG_LZ4;
+    if (!strcasecmp(ext, "zip")) return IMG_ZIP;
+    if (!strcasecmp(ext, "wim") || !strcasecmp(ext, "swm")) return IMG_WIM;
     return IMG_RAW;
 }
 
@@ -601,6 +658,15 @@ const char *get_image_type_name(image_type_t type) {
     }
 }
 
+static int writable_image_type(image_type_t type) {
+    switch (type) {
+        case IMG_ISO: case IMG_IMG: case IMG_RAW:
+        case IMG_XZ: case IMG_GZ: case IMG_BZ2: case IMG_ZSTD: case IMG_LZ4:
+            return 1;
+        default: return 0; /* QCOW, DMG, VHD, archives etc. need conversion first. */
+    }
+}
+
 int is_compressed_image(image_type_t type) {
     return type == IMG_XZ || type == IMG_GZ || type == IMG_BZ2 || 
            type == IMG_ZSTD || type == IMG_LZ4 || type == IMG_ZIP;
@@ -624,67 +690,45 @@ static const char *decompressor_tool_for_type(image_type_t type) {
     }
 }
 
+static int trusted_command(const char *name, char *result, size_t len);
+static void exec_trusted_path(const char *path, const char *const argv[]);
 static int start_decompressor(image_type_t type, const char *path, pid_t *pid_out) {
     int pipefd[2];
-    if (pipe(pipefd) != 0) {
-        log_message("ERROR", "pipe failed: %s", strerror(errno));
-        return -1;
+    int infile = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (infile < 0) return -1;
+    struct stat st;
+    if (fstat(infile, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(infile); errno = EINVAL; return -1;
     }
-
+    if (pipe(pipefd) != 0) { close(infile); return -1; }
     const char *tool = decompressor_tool_for_type(type);
-    if (!tool) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        errno = EINVAL;
-        return -1;
+    char cmd_path[PATH_MAX];
+    if (!tool || trusted_command(tool, cmd_path, sizeof(cmd_path)) != 0) {
+        close(infile); close(pipefd[0]); close(pipefd[1]); errno = ENOENT; return -1;
     }
-
     pid_t pid = fork();
     if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        log_message("ERROR", "fork failed: %s", strerror(errno));
-        return -1;
+        close(infile); close(pipefd[0]); close(pipefd[1]); return -1;
     }
-
     if (pid == 0) {
         close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
+        if (dup2(infile, STDIN_FILENO) < 0 ||
+            dup2(pipefd[1], STDOUT_FILENO) < 0) _exit(126);
+        close(infile);
         close(pipefd[1]);
-
-        switch (type) {
-            case IMG_XZ:
-                if (strcmp(tool, "xz") == 0) execlp(tool, tool, "-dc", path, (char *)NULL);
-                else execlp(tool, tool, path, (char *)NULL);
-                break;
-            case IMG_GZ:
-                if (strcmp(tool, "gzip") == 0) execlp(tool, tool, "-dc", path, (char *)NULL);
-                else execlp(tool, tool, path, (char *)NULL);
-                break;
-            case IMG_BZ2:
-                if (strcmp(tool, "bzip2") == 0) execlp(tool, tool, "-dc", path, (char *)NULL);
-                else execlp(tool, tool, path, (char *)NULL);
-                break;
-            case IMG_ZSTD:
-                execlp(tool, tool, "-dc", path, (char *)NULL);
-                break;
-            case IMG_LZ4:
-                execlp(tool, tool, "-dc", path, (char *)NULL);
-                break;
-            case IMG_ZIP:
-                execlp(tool, tool, "-p", path, (char *)NULL);
-                break;
-            default:
-                break;
+        if (!strcmp(tool, "xzcat") || !strcmp(tool, "zcat") || !strcmp(tool, "bzcat")) {
+            const char *args[] = {tool, NULL};
+            exec_trusted_path(cmd_path, args);
+        } else {
+            const char *args[] = {tool, "-dc", NULL};
+            exec_trusted_path(cmd_path, args);
         }
-        _exit(127);
     }
-
+    close(infile);
     close(pipefd[1]);
     *pid_out = pid;
     return pipefd[0];
 }
-
 
 static int program_exists_portable(const char *program) {
     if (!program || !*program) return 0;
@@ -735,15 +779,46 @@ static void remember_executable_path(const char *arg0) {
     } while (1);
 }
 
-static int run_program_quiet(const char *const argv[]) {
+/* External commands run with a fixed, minimal environment and executable
+ * paths whose parent directories are owned by root and not writable by others.
+ * Never trust a sudo caller's PATH for root-owned disk operations. */
+static const char *const command_dirs[] = {
+    "/usr/sbin", "/usr/bin", "/sbin", "/bin", "/usr/local/sbin", "/usr/local/bin", NULL
+};
+static int trusted_command(const char *name, char *result, size_t len) {
+    if (!name || !*name || strchr(name, '/')) return -1;
+    for (int i = 0; command_dirs[i]; ++i) {
+        const char *dir = command_dirs[i];
+        struct stat st;
+        if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != 0 ||
+            (st.st_mode & (S_IWGRP | S_IWOTH))) continue;
+        if (snprintf(result, len, "%s/%s", dir, name) >= (int)len) continue;
+        if (stat(result, &st) == 0 && S_ISREG(st.st_mode) && st.st_uid == 0 &&
+            !(st.st_mode & (S_IWGRP | S_IWOTH)) && access(result, X_OK) == 0) return 0;
+    }
+    return -1;
+}
+
+static void exec_trusted_path(const char *path, const char *const argv[]) {
+    /* The child after fork may only call async-signal-safe APIs. */
+    char *const env[] = {
+        "PATH=/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin:/usr/local/bin",
+        "HOME=/", "LANG=C", "LC_ALL=C", NULL
+    };
+    execve(path, (char * const *)argv, env);
+    _exit(127);
+}
+
+static int UI_UNUSED run_program_quiet(const char *const argv[]) {
     if (!argv || !argv[0]) { errno = EINVAL; return -1; }
+    char cmd_path[PATH_MAX];
+    if (trusted_command(argv[0], cmd_path, sizeof(cmd_path)) != 0) return -1;
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
         int nullfd = open("/dev/null", O_WRONLY);
         if (nullfd >= 0) { dup2(nullfd, STDERR_FILENO); if (nullfd > STDERR_FILENO) close(nullfd); }
-        execvp(argv[0], (char * const *)argv);
-        _exit(errno == ENOENT ? 127 : 126);
+        exec_trusted_path(cmd_path, argv);
     }
     int status = 0;
     while (waitpid(pid, &status, 0) < 0) { if (errno == EINTR) continue; return -1; }
@@ -802,7 +877,7 @@ static int open_image_reader(const char *path, image_type_t type, pid_t *pid_out
     *mode_out = "raw file";
 
     if (!is_compressed_image(type)) {
-        return open(path, O_RDONLY);
+        return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     }
 
     const char *tool = decompressor_tool_for_type(type);
@@ -825,109 +900,60 @@ static int close_image_reader(int fd, pid_t pid, const char *mode) {
 static int buffer_contains_ascii_ci(const unsigned char *haystack, size_t haystack_len,
                                     const char *needle) {
     size_t needle_len = strlen(needle);
-    if (needle_len == 0 || haystack_len < needle_len) return 0;
-
-    for (size_t i = 0; i <= haystack_len - needle_len; i++) {
-        size_t j = 0;
+    if (!needle_len || haystack_len < needle_len) return 0;
+    unsigned char first = (unsigned char)tolower((unsigned char)needle[0]);
+    /* The first-byte filter avoids the original O(chunks * patterns * chars)
+     * scan across hundreds of MiB on mostly unrelated binary data. */
+    for (size_t i = 0; i + needle_len <= haystack_len; i++) {
+        if (tolower(haystack[i]) != first) continue;
+        size_t j = 1;
         for (; j < needle_len; j++) {
-            unsigned char a = haystack[i + j];
-            unsigned char b = (unsigned char)needle[j];
-            if (tolower(a) != tolower(b)) break;
+            if (tolower(haystack[i+j]) != (unsigned char)tolower((unsigned char)needle[j])) break;
         }
         if (j == needle_len) return 1;
     }
-
     return 0;
 }
 
 int is_windows_image(const char *image_path) {
-    int fd = open(image_path, O_RDONLY);
+    /* Heuristic only. Explicit Windows mode is available if an ISO is unusual. */
+    int fd = open(image_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return 0;
-
-    /*
-     * Windows ISO directory records are not guaranteed to live in the first
-     * 64 KiB. Scan a sane prefix with overlap and bounded case-insensitive
-     * matching so Windows 10/11 ISOs do not silently fall through to raw-dd mode.
-     */
-    const size_t chunk_size = 1024 * 1024;
-    const size_t overlap = 256;
-    const uint64_t max_scan = 256ULL * 1024ULL * 1024ULL;
-    unsigned char *buf = malloc(chunk_size + overlap);
-    if (!buf) {
-        close(fd);
-        return 0;
-    }
-
+    const size_t chunk = 1u << 20;
+    const size_t overlap = 64;
+    const uint64_t limit = 64ULL << 20;
+    unsigned char *buf = malloc(chunk + overlap);
+    if (!buf) { close(fd); return 0; }
     size_t carry = 0;
-    uint64_t scanned = 0;
-    int saw_boot_wim = 0;
-    int saw_install_image = 0;
-    int saw_efi = 0;
-    int saw_windows = 0;
-
-    while (scanned < max_scan) {
-        ssize_t n = read(fd, buf + carry, chunk_size);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
+    uint64_t done = 0;
+    int boot_wim = 0, install_image = 0, boot_info = 0;
+    while (done < limit) {
+        ssize_t n = read(fd, buf + carry, chunk);
+        if (n < 0) { if (errno == EINTR) continue; break; }
         if (n == 0) break;
-
-        size_t total = carry + (size_t)n;
-
-        if (buffer_contains_ascii_ci(buf, total, "sources/boot.wim") ||
-            buffer_contains_ascii_ci(buf, total, "boot.wim;1") ||
-            buffer_contains_ascii_ci(buf, total, "boot.wim")) {
-            saw_boot_wim = 1;
-        }
-
-        if (buffer_contains_ascii_ci(buf, total, "sources/install.wim") ||
-            buffer_contains_ascii_ci(buf, total, "sources/install.esd") ||
-            buffer_contains_ascii_ci(buf, total, "install.wim;1") ||
-            buffer_contains_ascii_ci(buf, total, "install.esd;1") ||
-            buffer_contains_ascii_ci(buf, total, "install.wim") ||
-            buffer_contains_ascii_ci(buf, total, "install.esd")) {
-            saw_install_image = 1;
-        }
-
-        if (buffer_contains_ascii_ci(buf, total, "efi/microsoft") ||
-            buffer_contains_ascii_ci(buf, total, "efi/boot") ||
-            buffer_contains_ascii_ci(buf, total, "bootx64.efi") ||
-            buffer_contains_ascii_ci(buf, total, "microsoft")) {
-            saw_efi = 1;
-        }
-
-        if (buffer_contains_ascii_ci(buf, total, "microsoft corporation") ||
-            buffer_contains_ascii_ci(buf, total, "bootmgr") ||
-            buffer_contains_ascii_ci(buf, total, "windows")) {
-            saw_windows = 1;
-        }
-
-        if (saw_boot_wim && saw_install_image && (saw_efi || saw_windows)) {
-            free(buf);
-            close(fd);
-            return 3;
-        }
-
-        scanned += (uint64_t)n;
-        carry = total > overlap ? overlap : total;
-        memmove(buf, buf + total - carry, carry);
+        size_t len = carry + (size_t)n;
+        if (!boot_wim) boot_wim = buffer_contains_ascii_ci(buf, len, "boot.wim");
+        if (!install_image) install_image = buffer_contains_ascii_ci(buf, len, "install.wim") ||
+                                             buffer_contains_ascii_ci(buf, len, "install.esd");
+        if (!boot_info) boot_info = buffer_contains_ascii_ci(buf, len, "bootmgr") ||
+                                   buffer_contains_ascii_ci(buf, len, "bootx64.efi");
+        if (boot_wim && install_image && boot_info) break;
+        done += (uint64_t)n;
+        carry = len < overlap ? len : overlap;
+        memmove(buf, buf + len - carry, carry);
     }
-
     free(buf);
     close(fd);
-
-    if (saw_boot_wim && saw_install_image) return 2;
-    if ((saw_boot_wim || saw_install_image) && (saw_efi || saw_windows)) return 1;
-    return 0;
+    return boot_wim && install_image ? (boot_info ? 3 : 2) : 0;
 }
+
 
 
 
 
 #if defined(__linux__)
 static uint64_t get_device_size(const char *path);
-static int unmount_device(const char *device);
+static int UI_UNUSED unmount_device(const char *device);
 
 static void set_write_status(write_context_t *ctx, write_state_t state, double progress,
                              const char *fmt, ...) {
@@ -976,6 +1002,11 @@ static int run_cmdv(const char *const argv[]) {
     }
     log_message("INFO", "RUN: %s", rendered);
 
+    char cmd_path[PATH_MAX];
+    if (trusted_command(argv[0], cmd_path, sizeof(cmd_path)) != 0) {
+        log_message("ERROR", "Untrusted or missing command: %s", argv[0]);
+        return -1;
+    }
     pid_t pid = fork();
     if (pid < 0) {
         log_message("ERROR", "fork failed: %s", strerror(errno));
@@ -983,8 +1014,7 @@ static int run_cmdv(const char *const argv[]) {
     }
 
     if (pid == 0) {
-        execvp(argv[0], (char * const *)argv);
-        _exit(127);
+        exec_trusted_path(cmd_path, argv);
     }
 
     int status = 0;
@@ -1013,6 +1043,10 @@ static int run_cmdv_capture(const char *const argv[], char *out, size_t out_len)
         return -1;
     }
 
+    char cmd_path[PATH_MAX];
+    if (trusted_command(argv[0], cmd_path, sizeof(cmd_path)) != 0) {
+        close(pipefd[0]); close(pipefd[1]); return -1;
+    }
     pid_t pid = fork();
     if (pid < 0) {
         close(pipefd[0]);
@@ -1025,8 +1059,7 @@ static int run_cmdv_capture(const char *const argv[], char *out, size_t out_len)
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
-        execvp(argv[0], (char * const *)argv);
-        _exit(127);
+        exec_trusted_path(cmd_path, argv);
     }
 
     close(pipefd[1]);
@@ -1040,7 +1073,11 @@ static int run_cmdv_capture(const char *const argv[], char *out, size_t out_len)
         }
         if (n == 0) break;
         used += (size_t)n;
-        if (used >= out_len - 1) break;
+        if (used >= out_len - 1) {
+            char discard[512];
+            while (read(pipefd[0], discard, sizeof(discard)) > 0) {}
+            break;
+        }
     }
     out[used] = '\0';
 
@@ -1081,14 +1118,21 @@ static int mkdir_p(const char *path, mode_t mode) {
 static void partition_path_linux(const char *device, int partno, char *out, size_t out_len) {
     size_t len = strlen(device);
     int needs_p = len > 0 && isdigit((unsigned char)device[len - 1]);
-    snprintf(out, out_len, "%s%s%d", device, needs_p ? "p" : "", partno);
+    if (len >= out_len || out_len - len < 4 || partno < 1 || partno > 9) {
+        if (out_len) out[0] = '\0';
+        return;
+    }
+    memcpy(out, device, len);
+    int suffix = snprintf(out + len, out_len - len, "%s%d", needs_p ? "p" : "", partno);
+    if (suffix < 0 || (size_t)suffix >= out_len - len) out[0] = '\0';
 }
 
 static int is_child_partition_path(const char *device, const char *candidate) {
     size_t n = strlen(device);
     if (strncmp(device, candidate, n) != 0) return 0;
     char c = candidate[n];
-    return isdigit((unsigned char)c) || c == 'p';
+    return c == 'p' || c == 's' ||
+           (isdigit((unsigned char)c) && n > 0 && !isdigit((unsigned char)device[n-1]));
 }
 
 
@@ -1099,41 +1143,92 @@ static int mount_source_matches_device_linux(const char *device, const char *sou
     return 0;
 }
 
+/* Resolve target block device through sysfs, not guessed /dev names: this
+ * protects roots mounted through dm-crypt/LVM/MD as well as plain partitions.
+ * Fail closed when a device cannot be resolved or mount/swap data is unreadable. */
+static int linux_dev_matches_recursive(const char *sysdir, dev_t wanted, int depth) {
+    if (depth > 12) return -1;
+    char path[PATH_MAX];
+    struct stat st;
+    int n = snprintf(path, sizeof(path), "%s/dev", sysdir);
+    if (n <= 0 || (size_t)n >= sizeof(path)) return -1;
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    unsigned maj = 0, min = 0;
+    int ok = fscanf(f, "%u:%u", &maj, &min) == 2;
+    fclose(f);
+    if (!ok) return -1;
+    if (makedev(maj, min) == wanted) return 1;
+    const char *folders[] = {"holders", NULL};
+    for (int i = 0; folders[i]; ++i) {
+        snprintf(path, sizeof(path), "%s/%s", sysdir, folders[i]);
+        DIR *d = opendir(path);
+        if (!d) return -1;
+        struct dirent *entry;
+        while ((entry = readdir(d))) {
+            if (entry->d_name[0] == '.') continue;
+            char child[PATH_MAX];
+            snprintf(child, sizeof(child), "/sys/class/block/%s", entry->d_name);
+            int found = linux_dev_matches_recursive(child, wanted, depth + 1);
+            if (found != 0) { closedir(d); return found; }
+        }
+        closedir(d);
+    }
+    /* Partitions are visible as immediate children of the base device symlink. */
+    DIR *d = opendir(sysdir);
+    if (!d) return -1;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char child[PATH_MAX], partition_marker[PATH_MAX];
+        snprintf(child, sizeof(child), "%s/%s", sysdir, e->d_name);
+        if (snprintf(partition_marker, sizeof(partition_marker), "%s/partition", child) >=
+            (int)sizeof(partition_marker)) { closedir(d); return -1; }
+        if (stat(partition_marker, &st) != 0) continue;
+        int found = linux_dev_matches_recursive(child, wanted, depth + 1);
+        if (found != 0) { closedir(d); return found; }
+    }
+    closedir(d);
+    return 0;
+}
+
+static int linux_target_contains_dev(const char *device, dev_t wanted) {
+    struct stat st;
+    if (stat(device, &st) != 0 || !S_ISBLK(st.st_mode)) return -1;
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "/sys/dev/block/%u:%u", major(st.st_rdev), minor(st.st_rdev));
+    return linux_dev_matches_recursive(path, wanted, 0);
+}
+
 static int target_has_critical_mount_linux(const char *device) {
-    const char *critical[] = {"/", "/home", "/boot", "/boot/efi", NULL};
-
-    FILE *f = setmntent("/proc/self/mounts", "r");
-    if (!f) f = setmntent("/proc/mounts", "r");
-
-    if (f) {
-        struct mntent *mnt;
-        while ((mnt = getmntent(f)) != NULL) {
-            for (int i = 0; critical[i]; i++) {
-                if (strcmp(mnt->mnt_dir, critical[i]) == 0 &&
-                    mount_source_matches_device_linux(device, mnt->mnt_fsname)) {
-                    log_message("ERROR", "Target device contains active critical mount %s (%s)",
-                                mnt->mnt_dir, mnt->mnt_fsname);
-                    endmntent(f);
-                    return 1;
-                }
-            }
-        }
-        endmntent(f);
-    }
-
-    if (check_tool("findmnt")) {
-        for (int i = 0; critical[i]; i++) {
-            char source[MAX_PATH_LEN];
-            const char *argv[] = {"findmnt", "-n", "-o", "SOURCE", "--target", critical[i], NULL};
-            if (run_cmdv_capture(argv, source, sizeof(source)) == 0 &&
-                mount_source_matches_device_linux(device, source)) {
-                log_message("ERROR", "Target device contains active critical mount %s (%s)",
-                            critical[i], source);
-                return 1;
-            }
+    const char *critical[] = {"/", "/boot", "/boot/efi", "/home", "/usr", "/var", NULL};
+    for (int i = 0; critical[i]; i++) {
+        struct stat st;
+        if (stat(critical[i], &st) != 0) continue;
+        int found = linux_target_contains_dev(device, st.st_dev);
+        if (found != 0) {
+            log_message("ERROR", "Cannot prove %s does not contain %s (result %d)", device, critical[i], found);
+            return 1;
         }
     }
-
+    FILE *swaps = fopen("/proc/swaps", "r");
+    if (!swaps) return 1;
+    char line[4096];
+    (void)fgets(line, sizeof(line), swaps); /* header */
+    while (fgets(line, sizeof(line), swaps)) {
+        char path[2048];
+        if (sscanf(line, "%2047s", path) != 1 || path[0] != '/') continue;
+        struct stat st;
+        if (stat(path, &st) != 0) { fclose(swaps); return 1; }
+        if (S_ISBLK(st.st_mode)) {
+            int found = linux_target_contains_dev(device, st.st_rdev);
+            if (found != 0) { fclose(swaps); return 1; }
+        } else if (S_ISREG(st.st_mode)) {
+            int found = linux_target_contains_dev(device, st.st_dev);
+            if (found != 0) { fclose(swaps); return 1; }
+        }
+    }
+    fclose(swaps);
     return 0;
 }
 
@@ -1149,7 +1244,22 @@ static int unmount_device_linux_deep(const char *device) {
     int count = 0;
     struct mntent *mnt;
     while ((mnt = getmntent(f)) != NULL && count < 128) {
-        if (strcmp(mnt->mnt_fsname, device) == 0 || is_child_partition_path(device, mnt->mnt_fsname)) {
+        int belongs = mount_source_matches_device_linux(device, mnt->mnt_fsname);
+        if (!belongs) {
+            struct stat mounted;
+            if (stat(mnt->mnt_dir, &mounted) != 0) {
+                log_message("ERROR", "Cannot stat mounted filesystem %s", mnt->mnt_dir);
+                endmntent(f); return -1;
+            }
+            belongs = linux_target_contains_dev(device, mounted.st_dev);
+            if (belongs < 0) { endmntent(f); return -1; }
+        }
+        if (belongs) {
+            const char *mp = mnt->mnt_dir;
+            if (!strcmp(mp, "/") || !strcmp(mp, "/home") || !strcmp(mp, "/usr") ||
+                !strcmp(mp, "/var") || !strcmp(mp, "/boot") || !strcmp(mp, "/boot/efi")) {
+                endmntent(f); return -1;
+            }
             snprintf(entries[count].spec, sizeof(entries[count].spec), "%s", mnt->mnt_fsname);
             snprintf(entries[count].mountpoint, sizeof(entries[count].mountpoint), "%s", mnt->mnt_dir);
             count++;
@@ -1173,7 +1283,14 @@ static int unmount_device_linux_deep(const char *device) {
     if (!f) f = setmntent("/proc/mounts", "r");
     if (f) {
         while ((mnt = getmntent(f)) != NULL) {
-            if (strcmp(mnt->mnt_fsname, device) == 0 || is_child_partition_path(device, mnt->mnt_fsname)) {
+            int belongs = mount_source_matches_device_linux(device, mnt->mnt_fsname);
+            if (!belongs) {
+                struct stat mounted;
+                if (stat(mnt->mnt_dir, &mounted) != 0) { failed = 1; break; }
+                belongs = linux_target_contains_dev(device, mounted.st_dev);
+                if (belongs < 0) { failed = 1; break; }
+            }
+            if (belongs) {
                 log_message("ERROR", "Target is still mounted at %s", mnt->mnt_dir);
                 failed = 1;
                 break;
@@ -1221,7 +1338,7 @@ static int wipe_device_linux(const char *device) {
     unsigned char zeros[1024 * 1024];
     memset(zeros, 0, sizeof(zeros));
 
-    if (lseek(fd, 0, SEEK_SET) < 0 || write(fd, zeros, sizeof(zeros)) < 0) {
+    if (lseek(fd, 0, SEEK_SET) < 0 || write(fd, zeros, sizeof(zeros)) != (ssize_t)sizeof(zeros)) {
         log_message("ERROR", "Failed to wipe start of device: %s", strerror(errno));
         close(fd);
         return -1;
@@ -1231,7 +1348,9 @@ static int wipe_device_linux(const char *device) {
     if (dev_size > sizeof(zeros)) {
         off_t off = (off_t)(dev_size - sizeof(zeros));
         if (lseek(fd, off, SEEK_SET) >= 0) {
-            (void)write(fd, zeros, sizeof(zeros));
+            if (write(fd, zeros, sizeof(zeros)) != (ssize_t)sizeof(zeros)) {
+                close(fd); return -1;
+            }
         }
     }
 
@@ -1243,6 +1362,7 @@ static int wipe_device_linux(const char *device) {
 static int create_windows_fat32_partition(const char *device, partition_scheme_t scheme,
                                           char *partition_out, size_t partition_out_len) {
     partition_path_linux(device, 1, partition_out, partition_out_len);
+    if (!partition_out[0]) return -1;
 
     if (scheme == PARTscheme_GPT) {
         const char *mklabel[] = {"parted", "-s", device, "mklabel", "gpt", NULL};
@@ -1299,13 +1419,13 @@ static int mount_iso_linux(const char *iso_path, char *loop_dev, char *mount_poi
         return -1;
     }
 
-    const char *losetup[] = {"losetup", "--find", "--show", "--read-only", "--nooverlap", iso_path, NULL};
+    const char *losetup[] = {"losetup", "--find", "--show", "--read-only", "--nooverlap", "--", iso_path, NULL};
     if (run_cmdv_capture(losetup, loop_dev, MAX_PATH_LEN) != 0 || strncmp(loop_dev, "/dev/", 5) != 0) {
         log_message("ERROR", "Failed to allocate loop device for ISO");
         return -1;
     }
 
-    const char *mount_args[] = {"mount", "-o", "ro", loop_dev, mount_point, NULL};
+    const char *mount_args[] = {"mount", "-o", "ro,nosuid,nodev,noexec", loop_dev, mount_point, NULL};
     if (run_cmdv(mount_args) != 0) {
         const char *detach[] = {"losetup", "-d", loop_dev, NULL};
         run_cmdv(detach);
@@ -1319,19 +1439,17 @@ static int mount_iso_linux(const char *iso_path, char *loop_dev, char *mount_poi
 
 static int unmount_iso_linux(const char *loop_dev, const char *mount_point) {
     log_message("INFO", "Unmounting ISO from %s", mount_point);
-
+    int rc = 0;
     if (mount_point && *mount_point) {
         const char *umount_args[] = {"umount", mount_point, NULL};
-        run_cmdv(umount_args);
-        rmdir(mount_point);
+        if (run_cmdv(umount_args) != 0) rc = -1;
+        if (rmdir(mount_point) != 0) rc = -1;
     }
-
     if (loop_dev && *loop_dev) {
         const char *detach[] = {"losetup", "-d", loop_dev, NULL};
-        run_cmdv(detach);
+        if (run_cmdv(detach) != 0) rc = -1;
     }
-
-    return 0;
+    return rc;
 }
 
 static int mount_partition_linux_rw(const char *partition, const char *mount_point, int readonly) {
@@ -1340,7 +1458,7 @@ static int mount_partition_linux_rw(const char *partition, const char *mount_poi
         return -1;
     }
 
-    const char *opts = readonly ? "ro" : "rw";
+    const char *opts = readonly ? "ro,nosuid,nodev,noexec" : "rw,nosuid,nodev,noexec";
     const char *argv[] = {"mount", "-o", opts, partition, mount_point, NULL};
     return run_cmdv(argv);
 }
@@ -1379,7 +1497,7 @@ static uint64_t count_bytes_in_dir_excluding(const char *dir, const char *skip_p
 }
 
 static int copy_file_stream(const char *src, const char *dst, write_context_t *ctx) {
-    int in = open(src, O_RDONLY | O_CLOEXEC);
+    int in = open(src, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (in < 0) {
         log_message("ERROR", "Cannot open source file %s: %s", src, strerror(errno));
         return -1;
@@ -1418,13 +1536,14 @@ static int copy_file_stream(const char *src, const char *dst, write_context_t *c
         ssize_t off = 0;
         while (off < n) {
             ssize_t w = write(out, buf + off, (size_t)(n - off));
-            if (w < 0) {
+            if (w <= 0) {
                 if (errno == EINTR) continue;
                 log_message("ERROR", "Write failed for %s: %s", dst, strerror(errno));
                 rc = -1;
                 break;
             }
             off += w;
+            pthread_mutex_lock(&app.mutex);
             ctx->bytes_written += (uint64_t)w;
             if (ctx->bytes_total > 0) {
                 ctx->progress = (double)ctx->bytes_written / (double)ctx->bytes_total * 100.0;
@@ -1434,6 +1553,7 @@ static int copy_file_stream(const char *src, const char *dst, write_context_t *c
             format_size(ctx->bytes_written, copied_buf, sizeof(copied_buf));
             format_size(ctx->bytes_total, total_buf, sizeof(total_buf));
             snprintf(ctx->message, sizeof(ctx->message), "Copying Windows files: %s / %s", copied_buf, total_buf);
+            pthread_mutex_unlock(&app.mutex);
             write_status_snapshot_throttled(ctx, 0);
         }
 
@@ -1442,8 +1562,8 @@ static int copy_file_stream(const char *src, const char *dst, write_context_t *c
 
     /* One final filesystem/device sync is much faster than fsync() on every copied file. */
     free(buf);
-    close(in);
-    close(out);
+    if (close(in) != 0 && rc == 0) rc = -1;
+    if (close(out) != 0 && rc == 0) rc = -1;
 
     if (rc == -2) {
         log_message("INFO", "Copy cancelled");
@@ -1483,8 +1603,10 @@ static int copy_tree_excluding(const char *src, const char *dst,
 
             char src_path[MAX_PATH_LEN];
             char dst_path[MAX_PATH_LEN];
-            snprintf(src_path, sizeof(src_path), "%s/%s", src, entry->d_name);
-            snprintf(dst_path, sizeof(dst_path), "%s/%s", dst, entry->d_name);
+            if (snprintf(src_path, sizeof(src_path), "%s/%s", src, entry->d_name) >= (int)sizeof(src_path) ||
+                snprintf(dst_path, sizeof(dst_path), "%s/%s", dst, entry->d_name) >= (int)sizeof(dst_path)) {
+                closedir(dir); errno = ENAMETOOLONG; return -1;
+            }
 
             int rc = copy_tree_excluding(src_path, dst_path, skip_path, ctx);
             if (rc != 0) {
@@ -1533,9 +1655,17 @@ static uint64_t count_files_in_dir(const char *dir) {
 }
 
 static int find_first_existing(char out[MAX_PATH_LEN], const char *base, const char *const names[]) {
+    char root[MAX_PATH_LEN];
+    if (!realpath(base, root)) { out[0] = '\0'; return -1; }
+    size_t root_len = strlen(root);
     for (int i = 0; names[i]; i++) {
-        snprintf(out, MAX_PATH_LEN, "%s/%s", base, names[i]);
-        if (access(out, F_OK) == 0) return 0;
+        if (snprintf(out, MAX_PATH_LEN, "%s/%s", base, names[i]) >= MAX_PATH_LEN) continue;
+        char resolved[MAX_PATH_LEN];
+        if (!realpath(out, resolved)) continue;
+        if (strncmp(resolved, root, root_len) != 0 || resolved[root_len] != '/') continue;
+        struct stat st;
+        if (lstat(out, &st) == 0 && S_ISREG(st.st_mode) && st.st_nlink >= 1)
+            return 0;
     }
     out[0] = '\0';
     return -1;
@@ -1551,13 +1681,13 @@ static int get_install_image(const char *iso_mount, char out[MAX_PATH_LEN], int 
     };
 
     struct stat st;
-    if (find_first_existing(out, iso_mount, install_wim_names) == 0 && stat(out, &st) == 0) {
+    if (find_first_existing(out, iso_mount, install_wim_names) == 0 && lstat(out, &st) == 0 && S_ISREG(st.st_mode)) {
         *is_wim = 1;
         *size_out = (uint64_t)st.st_size;
         return 0;
     }
 
-    if (find_first_existing(out, iso_mount, install_esd_names) == 0 && stat(out, &st) == 0) {
+    if (find_first_existing(out, iso_mount, install_esd_names) == 0 && lstat(out, &st) == 0 && S_ISREG(st.st_mode)) {
         *is_wim = 0;
         *size_out = (uint64_t)st.st_size;
         return 0;
@@ -1827,8 +1957,16 @@ static int windows_usb_write(const char *iso_path, const char *device_path, writ
     set_write_status(ctx, STATE_SYNCING, 98.0, "Syncing USB...");
     int mount_fd = open(usb_mount, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (mount_fd >= 0) {
-        if (syncfs(mount_fd) != 0) log_message("WARNING", "syncfs failed: %s", strerror(errno));
+        if (syncfs(mount_fd) != 0) {
+            int saved_errno = errno;
+            close(mount_fd);
+            set_write_status(ctx, STATE_ERROR, -1.0, "Device flush failed: %s", strerror(saved_errno));
+            goto cleanup;
+        }
         close(mount_fd);
+    } else {
+        set_write_status(ctx, STATE_ERROR, -1.0, "Cannot open Windows USB for final sync");
+        goto cleanup;
     }
 
     set_write_status(ctx, STATE_VERIFYING, 99.0, "Validating USB contents...");
@@ -1837,17 +1975,20 @@ static int windows_usb_write(const char *iso_path, const char *device_path, writ
         goto cleanup;
     }
 
-    set_write_status(ctx, STATE_COMPLETE, 100.0, "Complete! Windows USB is ready.");
-    log_message("INFO", "Windows USB creation completed successfully");
     rc = 0;
 
 cleanup:
     if (usb_mounted) {
         const char *umount_usb[] = {"umount", usb_mount, NULL};
-        run_cmdv(umount_usb);
+        if (run_cmdv(umount_usb) != 0) {
+            rc = -1; set_write_status(ctx, STATE_ERROR, -1.0, "Failed to unmount Windows USB safely");
+        }
     }
     if (iso_mounted) {
-        unmount_iso_linux(loop_dev, iso_mount);
+        if (unmount_iso_linux(loop_dev, iso_mount) != 0) {
+            rc = -1;
+            set_write_status(ctx, STATE_ERROR, -1.0, "Failed to detach mounted ISO");
+        }
     } else {
         if (loop_dev[0]) {
             const char *detach[] = {"losetup", "-d", loop_dev, NULL};
@@ -1858,6 +1999,7 @@ cleanup:
 
     if (usb_mount) rmdir(usb_mount);
 
+    if (rc == 0) set_write_status(ctx, STATE_COMPLETE, 100.0, "Complete! Windows USB is ready.");
     if (rc != 0 && ctx->state != STATE_ERROR && ctx->state != STATE_CANCELLED) {
         set_write_status(ctx, STATE_ERROR, -1.0, "Windows USB creation failed");
     }
@@ -2008,6 +2150,10 @@ uint32_t get_device_sector_size(const char *path) {
     if (ioctl(fd, DIOCGSECTORSIZE, &ss) == 0 && ss > 0) {
         sector_size = ss;
     }
+#elif defined(__OpenBSD__) || defined(__NetBSD__)
+    struct disklabel dl = {0};
+    if (ioctl(fd, DIOCGDINFO, &dl) == 0 && dl.d_secsize > 0)
+        sector_size = (uint32_t)dl.d_secsize;
 #endif
     
     close(fd);
@@ -2166,47 +2312,79 @@ int enumerate_devices_linux(device_t *devices, int max_devices) {
 int enumerate_devices_macos(device_t *devices, int max_devices) {
 #if defined(__APPLE__)
     int count = 0;
-    FILE *p = popen("diskutil list 2>/dev/null | grep '^/dev/disk' | awk '{print $1}'", "r");
-    
-    if (!p) return 0;
-    
-    char line[256];
-    while (fgets(line, sizeof(line), p) && count < max_devices) {
-        line[strcspn(line, "\n")] = '\0';
-        
-        if (strcmp(line, "/dev/disk0") == 0) continue;
+    char *listing = malloc(256 * 1024);
+    if (!listing) return 0;
+    const char *args[] = {"diskutil", "list", NULL};
+    if (run_cmdv_capture(args, listing, 256 * 1024) != 0) {
+        free(listing); return 0;
+    }
+    char *save = NULL;
+    char *line = strtok_r(listing, "\n", &save);
+    while (line && count < max_devices) {
+        if (strncmp(line, "/dev/disk", 9) != 0) { line = strtok_r(NULL, "\n", &save); continue; }
+        /* The diskutil heading is e.g. /dev/disk0 (internal, physical).
+         * Inspect it BEFORE truncating at the first whitespace. */
+        if (!strstr(line, "(external, physical)")) {
+            line = strtok_r(NULL, "\n", &save);
+            continue;
+        }
+        char *space = strpbrk(line, " \t");
+        if (space) *space = '\0';
         
         device_t *dev = &devices[count];
         memset(dev, 0, sizeof(device_t));
         
-        strncpy(dev->path, line, sizeof(dev->path) - 1);
+        /* Raw /dev/rdiskN is much faster for unbuffered device writes on macOS. */
+        snprintf(dev->path, sizeof(dev->path), "/dev/r%s", line + 5);
         char *name = strrchr(line, '/');
         snprintf(dev->name, sizeof(dev->name), "%s", name ? name + 1 : line);
         
         dev->size = get_device_size(dev->path);
-        if (dev->size == 0) continue;
-        
         dev->sector_size = get_device_sector_size(dev->path);
         dev->removable = 1;
-        
-        char cmd[512];
-        snprintf(cmd, sizeof(cmd), 
-                 "diskutil info %s 2>/dev/null | grep 'Device / Media Name' | cut -d: -f2", 
-                 line);
-        FILE *p2 = popen(cmd, "r");
-        if (p2) {
-            if (fgets(dev->model, sizeof(dev->model), p2)) {
-                dev->model[strcspn(dev->model, "\n")] = '\0';
-                char *m = dev->model;
-                while (*m == ' ') memmove(m, m + 1, strlen(m));
+        dev->readonly = is_device_readonly(dev->path);
+        snprintf(dev->model, sizeof(dev->model), "macOS disk %s", dev->name);
+        /* Unprivileged users may not be able to open /dev/rdisk*, even though
+         * diskutil exposes disk geometry. Use its documented `info` command as
+         * a discovery fallback; the privileged writer rechecks with ioctl. */
+        if (!dev->size) {
+            char *info = malloc(32 * 1024);
+            if (info) {
+                const char *info_args[] = {"diskutil", "info", line, NULL};
+                if (run_cmdv_capture(info_args, info, 32 * 1024) == 0) {
+                    char *mediasize = strstr(info, "Disk Size:");
+                    if (mediasize) {
+                        char *open_paren = strchr(mediasize, '(');
+                        if (open_paren) {
+                            char *end = NULL;
+                            errno = 0;
+                            unsigned long long bytes = strtoull(open_paren + 1, &end, 10);
+                            if (!errno && end && strstr(end, "Bytes") && bytes)
+                                dev->size = (uint64_t)bytes;
+                        }
+                    }
+                    char *sector_text = strstr(info, "Device Block Size:");
+                    if (sector_text) {
+                        unsigned block = 0;
+                        if (sscanf(sector_text + strlen("Device Block Size:"), "%u", &block) == 1 && block)
+                            dev->sector_size = block;
+                    }
+                    char *readonly = strstr(info, "Media Read-Only:");
+                    if (readonly) {
+                        readonly += strlen("Media Read-Only:");
+                        while (*readonly == ' ' || *readonly == '\t') readonly++;
+                        if (!strncmp(readonly, "Yes", 3)) dev->readonly = 1;
+                    }
+                }
+                free(info);
             }
-            pclose(p2);
         }
-        
+        if (dev->size == 0) { line = strtok_r(NULL, "\n", &save); continue; }
+
         count++;
+        line = strtok_r(NULL, "\n", &save);
     }
-    
-    pclose(p);
+    free(listing);
     return count;
 #else
     (void)devices;
@@ -2217,75 +2395,55 @@ int enumerate_devices_macos(device_t *devices, int max_devices) {
 
 int enumerate_devices_freebsd(device_t *devices, int max_devices) {
 #if defined(__FreeBSD__) || defined(__DragonFly__)
+    char *listing = malloc(256 * 1024);
+    if (!listing) return 0;
+    const char *args[] = {"geom", "disk", "list", NULL};
+    if (run_cmdv_capture(args, listing, 256 * 1024) != 0) { free(listing); return 0; }
     int count = 0;
-    FILE *p = popen("geom disk list 2>/dev/null", "r");
-    
-    if (!p) {
-        p = popen("ls /dev/da[0-9]* /dev/ada[0-9]* 2>/dev/null | grep -v '[sp][0-9]'", "r");
-        if (!p) return 0;
-        
-        char line[256];
-        while (fgets(line, sizeof(line), p) && count < max_devices) {
-            line[strcspn(line, "\n")] = '\0';
-            
-            device_t *dev = &devices[count];
-            memset(dev, 0, sizeof(device_t));
-            
-            strncpy(dev->path, line, sizeof(dev->path) - 1);
-            char *name = strrchr(line, '/');
-            snprintf(dev->name, sizeof(dev->name), "%s", name ? name + 1 : line);
-            
-            dev->size = get_device_size(dev->path);
-            if (dev->size == 0) continue;
-            
-            dev->sector_size = get_device_sector_size(dev->path);
-            dev->removable = (strncmp(dev->name, "da", 2) == 0);
-            
+    char *save = NULL;
+    device_t *current = NULL;
+    for (char *line = strtok_r(listing, "\n", &save); line && count < max_devices;
+         line = strtok_r(NULL, "\n", &save)) {
+        char name[128];
+        if (sscanf(line, "Geom name: %127s", name) == 1) {
+            if (count >= max_devices) break;
+            current = &devices[count];
+            memset(current, 0, sizeof(*current));
+            snprintf(current->name, sizeof(current->name), "%s", name);
+            snprintf(current->path, sizeof(current->path), "/dev/%s", name);
+            current->removable = is_device_removable(current->path);
+            current->size = get_device_size(current->path);
+            current->sector_size = get_device_sector_size(current->path);
+            current->readonly = is_device_readonly(current->path);
             count++;
-        }
-        pclose(p);
-        return count;
-    }
-    
-    char line[256];
-    device_t *current_dev = NULL;
-    // this shit is kinda scuffed
-    while (fgets(line, sizeof(line), p) && count < max_devices) {
-        char *geom_name = strstr(line, "Geom name:");
-        if (geom_name) {
-            char name[64];
-            if (sscanf(geom_name, "Geom name: %63s", name) == 1) {
-                current_dev = &devices[count];
-                memset(current_dev, 0, sizeof(device_t));
-                
-                snprintf(current_dev->path, sizeof(current_dev->path), "/dev/%s", name);
-                strncpy(current_dev->name, name, sizeof(current_dev->name) - 1);
-                current_dev->removable = (strncmp(name, "da", 2) == 0);
-            }
-        } else if (strstr(line, "Mediasize:") && current_dev) {
-            uint64_t size = 0;
-            if (sscanf(line, " Mediasize: %lu", (unsigned long *)&size) == 1) {
-                current_dev->size = size;
-                current_dev->sector_size = get_device_sector_size(current_dev->path);
-                count++;
-                current_dev = NULL;
-            }
-        } else if (strstr(line, "descr:") && current_dev) {
-            char *descr = strstr(line, "descr:");
-            if (descr) {
-                descr += 6;
-                while (*descr == ' ') descr++;
-                strncpy(current_dev->model, descr, sizeof(current_dev->model) - 1);
-                current_dev->model[strcspn(current_dev->model, "\n")] = '\0';
-            }
+        } else if (current && strstr(line, "Mediasize:")) {
+            const char *value = strstr(line, "Mediasize:") + strlen("Mediasize:");
+            while (*value == ' ' || *value == '\t') value++;
+            char *end = NULL;
+            errno = 0;
+            unsigned long long media_size = strtoull(value, &end, 10);
+            if (!errno && end != value && media_size > 0)
+                current->size = (uint64_t)media_size;
+        } else if (current && strstr(line, "Sectorsize:")) {
+            unsigned sector_size = 0;
+            if (sscanf(strstr(line, "Sectorsize:") + strlen("Sectorsize:"), "%u", &sector_size) == 1)
+                current->sector_size = sector_size;
+        } else if (current && strstr(line, "descr:")) {
+            char *descr = strstr(line, "descr:") + 6;
+            while (*descr == ' ') descr++;
+            snprintf(current->model, sizeof(current->model), "%s", descr);
         }
     }
-    
-    pclose(p);
-    return count;
+    free(listing);
+    int visible = 0;
+    for (int i = 0; i < count; ++i) {
+        if (!devices[i].size) continue;
+        if (visible != i) devices[visible] = devices[i];
+        ++visible;
+    }
+    return visible;
 #else
-    (void)devices;
-    (void)max_devices;
+    (void)devices; (void)max_devices;
     return 0;
 #endif
 }
@@ -2293,12 +2451,9 @@ int enumerate_devices_freebsd(device_t *devices, int max_devices) {
 int enumerate_devices_openbsd(device_t *devices, int max_devices) {
 #if defined(__OpenBSD__)
     int count = 0;
-    FILE *p = popen("sysctl -n hw.disknames 2>/dev/null", "r");
-    
-    if (!p) return 0;
-    
-    char line[1024];
-    if (fgets(line, sizeof(line), p)) {
+    char line[4096];
+    const char *args[] = {"sysctl", "-n", "hw.disknames", NULL};
+    if (run_cmdv_capture(args, line, sizeof(line)) == 0) {
         char *token = strtok(line, ",");
         while (token && count < max_devices) {
             while (*token == ' ') token++;
@@ -2328,7 +2483,6 @@ int enumerate_devices_openbsd(device_t *devices, int max_devices) {
         }
     }
     
-    pclose(p);
     return count;
 #else
     (void)devices;
@@ -2340,12 +2494,9 @@ int enumerate_devices_openbsd(device_t *devices, int max_devices) {
 int enumerate_devices_netbsd(device_t *devices, int max_devices) {
 #if defined(__NetBSD__)
     int count = 0;
-    FILE *p = popen("sysctl -n hw.disknames 2>/dev/null", "r");
-    
-    if (!p) return 0;
-    
-    char line[1024];
-    if (fgets(line, sizeof(line), p)) {
+    char line[4096];
+    const char *args[] = {"sysctl", "-n", "hw.disknames", NULL};
+    if (run_cmdv_capture(args, line, sizeof(line)) == 0) {
         char *token = strtok(line, " ");
         while (token && count < max_devices) {
             token[strcspn(token, "\n")] = '\0';
@@ -2354,7 +2505,11 @@ int enumerate_devices_netbsd(device_t *devices, int max_devices) {
                 device_t *dev = &devices[count];
                 memset(dev, 0, sizeof(device_t));
                 
-                snprintf(dev->path, sizeof(dev->path), "/dev/r%sd", token);
+                int raw_partition = 2;
+                size_t raw_size = sizeof(raw_partition);
+                (void)sysctlbyname("kern.rawpartition", &raw_partition, &raw_size, NULL, 0);
+                if (raw_partition < 0 || raw_partition > 25) raw_partition = 2;
+                snprintf(dev->path, sizeof(dev->path), "/dev/r%s%c", token, 'a' + raw_partition);
                 strncpy(dev->name, token, sizeof(dev->name) - 1);
                 
                 dev->size = get_device_size(dev->path);
@@ -2369,7 +2524,6 @@ int enumerate_devices_netbsd(device_t *devices, int max_devices) {
         }
     }
     
-    pclose(p);
     return count;
 #else
     (void)devices;
@@ -2412,46 +2566,26 @@ int enumerate_devices_solaris(device_t *devices, int max_devices) {
 }
 
 int enumerate_devices_generic(device_t *devices, int max_devices) {
+    /* Discovery is best-effort; writing on an unknown OS is fail-closed. */
+    const char *patterns[] = {"/dev/sd?", "/dev/hd?", "/dev/da?", "/dev/ada?",
+                              "/dev/wd?", "/dev/disk?", NULL};
     int count = 0;
-    const char *dev_patterns[] = {
-        "/dev/sd?",
-        "/dev/hd?",
-        "/dev/da?",
-        "/dev/ada?",
-        "/dev/wd?",
-        "/dev/disk?",
-        NULL
-    };
-    
-    for (int i = 0; dev_patterns[i] && count < max_devices; i++) {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "ls %s 2>/dev/null", dev_patterns[i]);
-        
-        FILE *p = popen(cmd, "r");
-        if (!p) continue;
-        
-        char line[256];
-        while (fgets(line, sizeof(line), p) && count < max_devices) {
-            line[strcspn(line, "\n")] = '\0';
-            
-            device_t *dev = &devices[count];
-            memset(dev, 0, sizeof(device_t));
-            
-            strncpy(dev->path, line, sizeof(dev->path) - 1);
-            char *name = strrchr(line, '/');
-            snprintf(dev->name, sizeof(dev->name), "%s", name ? name + 1 : line);
-            
-            dev->size = get_device_size(dev->path);
-            if (dev->size > 0) {
-                dev->sector_size = 512;
-                dev->removable = 1;
-                count++;
+    for (int i = 0; patterns[i] && count < max_devices; i++) {
+        glob_t globbuf = {0};
+        if (glob(patterns[i], 0, NULL, &globbuf) == 0) {
+            for (size_t j = 0; j < globbuf.gl_pathc && count < max_devices; j++) {
+                const char *path = globbuf.gl_pathv[j];
+                if (!valid_target_device_path(path)) continue;
+                device_t *dev = &devices[count];
+                memset(dev, 0, sizeof(*dev));
+                snprintf(dev->path, sizeof(dev->path), "%s", path);
+                snprintf(dev->name, sizeof(dev->name), "%s", strrchr(path, '/') + 1);
+                dev->size = get_device_size(path);
+                if (dev->size > 0) { dev->sector_size = get_device_sector_size(path); count++; }
             }
         }
-        
-        pclose(p);
+        globfree(&globbuf);
     }
-    
     return count;
 }
 
@@ -2480,30 +2614,124 @@ int enumerate_devices(device_t *devices, int max_devices) {
     }
 }
 
-int UI_UNUSED unmount_device(const char *device) {
-    if (!device || !*device) return -1;
-    log_message("INFO", "Unmounting device: %s", device);
+/* For non-Linux systems, require a successful whole-disk unmount and verify
+ * with the OS mount table that no volume on this disk is still mounted.
+ * Solaris/AIX/etc. need separate vetted mount/swap backends: fail closed. */
+#if defined(__NetBSD__)
+typedef struct statvfs ui_mount_stat_t;
+#else
+/* This type is only used on BSD/macOS inside platform-specific blocks. */
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+typedef struct statfs ui_mount_stat_t;
+#endif
+#endif
 
-    switch (app.os) {
-        case OS_MACOS: {
-            const char *argv[] = {"diskutil", "unmountDisk", device, NULL};
-            return run_program_quiet(argv);
-        }
-        case OS_LINUX: {
-            /* The deep Linux path handles child partitions. This is only a fallback. */
-            const char *argv[] = {"umount", device, NULL};
-            int rc = run_program_quiet(argv);
-            if (rc != 0 && program_exists_portable("udisksctl")) {
-                const char *uargv[] = {"udisksctl", "unmount", "-b", device, NULL};
-                rc = run_program_quiet(uargv);
-            }
-            return rc;
-        }
-        default: {
-            const char *argv[] = {"umount", device, NULL};
-            return run_program_quiet(argv);
+static int UI_UNUSED source_matches_whole_disk(const char *device, const char *source) {
+#if defined(__APPLE__)
+    char normalized[MAX_PATH_LEN];
+    if (!strncmp(device, "/dev/rdisk", 10)) {
+        snprintf(normalized, sizeof(normalized), "/dev/disk%s", device + 10);
+        device = normalized;
+    }
+#elif defined(__OpenBSD__) || defined(__NetBSD__)
+    char normalized[MAX_PATH_LEN];
+    if (!strncmp(device, "/dev/r", 6) && strlen(device) > 7) {
+        snprintf(normalized, sizeof(normalized), "/dev/%s", device + 6);
+        size_t length = strlen(normalized);
+        if (length > 1 && normalized[length - 1] >= 'a' && normalized[length - 1] <= 'z')
+            normalized[length - 1] = '\0';
+        size_t prefix = strlen(normalized);
+        if (!strncmp(source, normalized, prefix) &&
+            source[prefix] >= 'a' && source[prefix] <= 'p' && source[prefix+1] == '\0') return 1;
+    }
+#endif
+    return !strcmp(device, source) || is_child_partition_path(device, source);
+}
+
+static int UI_UNUSED target_has_critical_mount_portable(const char *device) {
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__DragonFly__) || \
+    defined(__OpenBSD__) || defined(__NetBSD__)
+    ui_mount_stat_t *mounts = NULL;
+    int count = getmntinfo(&mounts, MNT_NOWAIT);
+    if (count <= 0 || !mounts) return 1;
+    for (int i = 0; i < count; i++) {
+        const char *source = mounts[i].f_mntfromname;
+        if (source_matches_whole_disk(device, source)) {
+            const char *mp = mounts[i].f_mntonname;
+            if (!strcmp(mp, "/") || !strcmp(mp, "/usr") || !strcmp(mp, "/var") ||
+                !strcmp(mp, "/boot") || !strcmp(mp, "/home")) return 1;
         }
     }
+    return 0;
+#else
+    (void)device;
+    return 1;
+#endif
+}
+
+static int unmount_device(const char *device) {
+    if (!device || !*device) return -1;
+#if defined(__APPLE__)
+    char disk_path[MAX_PATH_LEN];
+    if (!strncmp(device, "/dev/rdisk", 10))
+        snprintf(disk_path, sizeof(disk_path), "/dev/disk%s", device + 10);
+    else snprintf(disk_path, sizeof(disk_path), "%s", device);
+    const char *args[] = {"diskutil", "unmountDisk", disk_path, NULL};
+    if (run_program_quiet(args) != 0) return -1;
+#elif defined(__FreeBSD__) || defined(__DragonFly__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    ui_mount_stat_t *mounts = NULL;
+    int count = getmntinfo(&mounts, MNT_NOWAIT);
+    if (count <= 0 || !mounts) return -1;
+    /* Unmount deepest mount points first, retrying until none remain. */
+    for (int pass = 0; pass < count; ++pass) {
+        int best = -1;
+        size_t len = 0;
+        for (int i = 0; i < count; i++) {
+            if (!mounts[i].f_mntonname[0] ||
+                (!source_matches_whole_disk(device, mounts[i].f_mntfromname))) continue;
+            size_t sz = strlen(mounts[i].f_mntonname);
+            if (sz > len) { len = sz; best = i; }
+        }
+        if (best < 0) break;
+        const char *args[] = {"umount", mounts[best].f_mntonname, NULL};
+        if (run_program_quiet(args) != 0) return -1;
+        mounts[best].f_mntonname[0] = 0;
+    }
+#else
+    (void)device;
+    errno = ENOTSUP;
+    return -1;
+#endif
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__DragonFly__) || \
+    defined(__OpenBSD__) || defined(__NetBSD__)
+    ui_mount_stat_t *after = NULL;
+    int number = getmntinfo(&after, MNT_NOWAIT);
+    if (number <= 0 || !after) return -1;
+    for (int i = 0; i < number; ++i) {
+        if (source_matches_whole_disk(device, after[i].f_mntfromname)) return -1;
+    }
+    return 0;
+#endif
+}
+
+/* The decompressor pipe may return tiny partial chunks. Coalesce them into
+ * sector-aligned device writes to avoid slow syscalls and BSD EINVAL errors. */
+static ssize_t read_chunk_full(int fd, unsigned char *buffer, size_t requested) {
+    size_t got = 0;
+    while (got < requested) {
+        if (signal_received || app.ctx.cancelled) { errno = ECANCELED; return -1; }
+        ssize_t n = read(fd, buffer + got, requested - got);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) return -1;
+        if (n == 0) break;
+        got += (size_t)n;
+    }
+    return (ssize_t)got;
+}
+
+static size_t round_up_sector(size_t value, size_t sector) {
+    if (!sector || value > SIZE_MAX - (sector - 1)) return 0;
+    return ((value + sector - 1) / sector) * sector;
 }
 
 void *write_thread(void *arg) {
@@ -2521,6 +2749,27 @@ void *write_thread(void *arg) {
     int compressed = is_compressed_image(image_type);
 
     /* Detection already ran before confirmation; never rescan a large ISO after the user says yes. */
+    /* Re-enumerate immediately before destructive work, including privileged
+     * helper invocations. A stale GTK row must not authorize a new disk. */
+    device_t currently_available[MAX_DEVICES];
+    int available_count = enumerate_devices(currently_available, MAX_DEVICES);
+    int target_still_present = 0;
+    for (int index = 0; index < available_count; ++index) {
+        if (strcmp(currently_available[index].path, device_path) == 0 &&
+            currently_available[index].size == app.selected_device->size &&
+            !currently_available[index].readonly) {
+            target_still_present = 1;
+            break;
+        }
+    }
+    if (!target_still_present) {
+        pthread_mutex_lock(&app.mutex);
+        ctx->state = STATE_ERROR; ctx->error_code = EACCES;
+        snprintf(ctx->message, sizeof(ctx->message), "Target is no longer an approved, enumerated whole disk");
+        pthread_mutex_unlock(&app.mutex);
+        goto cleanup;
+    }
+
     int is_windows = app.image.is_windows;
     if (is_windows > 0) {
         log_message("INFO", "Windows ISO detected (confidence: %d)", is_windows);
@@ -2542,6 +2791,15 @@ void *write_thread(void *arg) {
     }
 #endif
 
+#if !defined(__linux__)
+    if (target_has_critical_mount_portable(device_path)) {
+        pthread_mutex_lock(&app.mutex);
+        ctx->state = STATE_ERROR; ctx->error_code = EACCES;
+        snprintf(ctx->message, sizeof(ctx->message), "Cannot safely verify target is not a system disk");
+        pthread_mutex_unlock(&app.mutex);
+        goto cleanup;
+    }
+#endif
     if (ctx->mode == WRITE_MODE_WINDOWS) {
 #if defined(__linux__)
         log_message("INFO", "Using Windows file-based installation mode");
@@ -2586,7 +2844,27 @@ void *write_thread(void *arg) {
 
     log_message("INFO", "Starting write: %s -> %s", image_path, device_path);
     
-    buffer = malloc(ctx->block_size);
+    if (ctx->block_size < MIN_BLOCK_SIZE || ctx->block_size > MAX_BLOCK_SIZE) {
+        ctx->state = STATE_ERROR; ctx->error_code = EINVAL;
+        snprintf(ctx->message, sizeof(ctx->message), "Invalid I/O block size");
+        goto cleanup;
+    }
+    uint32_t sector = app.selected_device->sector_size;
+    if (sector < 512 || sector > 65536 || (sector & (sector - 1)) != 0)
+        sector = get_device_sector_size(device_path);
+    if (sector < 512 || sector > 65536 || (sector & (sector - 1)) != 0) {
+        ctx->state = STATE_ERROR; ctx->error_code = EINVAL;
+        snprintf(ctx->message, sizeof(ctx->message), "Unsupported sector size");
+        goto cleanup;
+    }
+    if (ctx->block_size < sector || ctx->block_size % sector != 0) {
+        ctx->block_size = (ctx->block_size / sector) * sector;
+        if (!ctx->block_size) ctx->block_size = sector;
+    }
+    /* Raw character-device I/O on BSD/macOS may also require an aligned
+     * user buffer, not just an aligned byte count. */
+    if (posix_memalign((void **)&buffer, (size_t)sector, ctx->block_size) != 0)
+        buffer = NULL;
     if (!buffer) {
         pthread_mutex_lock(&app.mutex);
         ctx->state = STATE_ERROR;
@@ -2611,8 +2889,13 @@ void *write_thread(void *arg) {
         goto cleanup;
     }
 #else
-    if (unmount_device(device_path) != 0)
-        log_message("WARNING", "Unmount command returned non-zero; open() will still enforce access rules");
+    if (unmount_device(device_path) != 0) {
+        pthread_mutex_lock(&app.mutex);
+        ctx->state = STATE_ERROR; ctx->error_code = EBUSY;
+        snprintf(ctx->message, sizeof(ctx->message), "Cannot safely unmount target");
+        pthread_mutex_unlock(&app.mutex);
+        goto cleanup;
+    }
 #endif
     
     src_fd = open_image_reader(image_path, image_type, &src_pid, &src_mode);
@@ -2626,6 +2909,9 @@ void *write_thread(void *arg) {
         goto cleanup;
     }
     log_message("INFO", "Image read mode: %s", src_mode);
+#if defined(POSIX_FADV_SEQUENTIAL)
+    (void)posix_fadvise(src_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
     
     /*
      * Do buffered sequential I/O and issue an explicit flush at the end. O_SYNC makes
@@ -2635,7 +2921,10 @@ void *write_thread(void *arg) {
 #ifdef O_CLOEXEC
     flags |= O_CLOEXEC;
 #endif
-    dst_fd = open(device_path, flags);
+#if defined(__linux__)
+    flags |= O_EXCL; /* Disallow writing any block device held open/mounted elsewhere. */
+#endif
+    dst_fd = open(device_path, flags | O_NOFOLLOW);
     
     if (dst_fd < 0) {
         pthread_mutex_lock(&app.mutex);
@@ -2648,6 +2937,26 @@ void *write_thread(void *arg) {
         goto cleanup;
     }
     
+    /* A swapped target path must not redirect writes between confirmation and open. */
+    struct stat opened_target;
+    if (fstat(dst_fd, &opened_target) != 0 ||
+        !(S_ISBLK(opened_target.st_mode) || S_ISCHR(opened_target.st_mode)) ||
+        (app.selected_device->size && get_device_size(device_path) != app.selected_device->size)) {
+        pthread_mutex_lock(&app.mutex);
+        ctx->state = STATE_ERROR; ctx->error_code = EACCES;
+        snprintf(ctx->message, sizeof(ctx->message), "Target changed or is not a disk");
+        pthread_mutex_unlock(&app.mutex);
+        goto cleanup;
+    }
+#if defined(__linux__)
+    if (target_has_critical_mount_linux(device_path)) {
+        pthread_mutex_lock(&app.mutex);
+        ctx->state = STATE_ERROR; ctx->error_code = EACCES;
+        snprintf(ctx->message, sizeof(ctx->message), "Target became an active system disk");
+        pthread_mutex_unlock(&app.mutex);
+        goto cleanup;
+    }
+#endif
     pthread_mutex_lock(&app.mutex);
     ctx->state = STATE_WRITING;
     ctx->start_time = time(NULL);
@@ -2659,13 +2968,20 @@ void *write_thread(void *arg) {
     pthread_mutex_unlock(&app.mutex);
     write_status_snapshot(ctx);
     
-    log_message("INFO", "Writing %lu bytes", (unsigned long)ctx->bytes_total);
+    log_message("INFO", "Writing %" PRIu64 " bytes", ctx->bytes_total);
     
-    while (!ctx->cancelled) {
-        ssize_t bytes_read = read(src_fd, buffer, ctx->block_size);
+    while (!ctx->cancelled && !signal_received) {
+        ssize_t bytes_read = read_chunk_full(src_fd, buffer, ctx->block_size);
         
         if (bytes_read < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR && !signal_received && !ctx->cancelled) continue;
+            if (errno == ECANCELED || signal_received || ctx->cancelled) {
+                pthread_mutex_lock(&app.mutex);
+                ctx->state = STATE_CANCELLED;
+                snprintf(ctx->message, sizeof(ctx->message), "Cancelled by user");
+                pthread_mutex_unlock(&app.mutex);
+                goto cleanup;
+            }
             pthread_mutex_lock(&app.mutex);
             ctx->state = STATE_ERROR;
             ctx->error_code = errno;
@@ -2677,14 +2993,26 @@ void *write_thread(void *arg) {
         }
         
         if (bytes_read == 0) break;
-        
+        uint64_t capacity = app.selected_device->size;
+        size_t padded = round_up_sector((size_t)bytes_read, (size_t)sector);
+        if (!padded || padded > ctx->block_size || capacity == 0 ||
+            ctx->bytes_written > capacity || (uint64_t)padded > capacity - ctx->bytes_written) {
+            pthread_mutex_lock(&app.mutex);
+            ctx->state = STATE_ERROR; ctx->error_code = ENOSPC;
+            snprintf(ctx->message, sizeof(ctx->message), "Image exceeds target capacity");
+            pthread_mutex_unlock(&app.mutex);
+            goto cleanup;
+        }
+        if (padded > (size_t)bytes_read)
+            memset(buffer + bytes_read, 0, padded - (size_t)bytes_read);
         ssize_t total_written = 0;
-        while (total_written < bytes_read && !ctx->cancelled) {
-            ssize_t written = write(dst_fd, buffer + total_written, 
-                                    (size_t)(bytes_read - total_written));
+        while ((size_t)total_written < padded && !ctx->cancelled && !signal_received) {
+            ssize_t written = write(dst_fd, buffer + total_written,
+                                    padded - (size_t)total_written);
             
-            if (written < 0) {
-                if (errno == EINTR) continue;
+            if (written <= 0) {
+                if (written < 0 && errno == EINTR && !ctx->cancelled && !signal_received) continue;
+                if (written == 0) errno = EIO;
                 pthread_mutex_lock(&app.mutex);
                 ctx->state = STATE_ERROR;
                 ctx->error_code = errno;
@@ -2697,7 +3025,13 @@ void *write_thread(void *arg) {
             
             total_written += written;
         }
-        
+        if ((size_t)total_written != padded) {
+            pthread_mutex_lock(&app.mutex);
+            ctx->state = STATE_CANCELLED;
+            snprintf(ctx->message, sizeof(ctx->message), "Cancelled during write");
+            pthread_mutex_unlock(&app.mutex);
+            goto cleanup;
+        }
         pthread_mutex_lock(&app.mutex);
         ctx->bytes_written += (uint64_t)bytes_read;
         if (!compressed && ctx->bytes_total > 0) {
@@ -2733,14 +3067,22 @@ void *write_thread(void *arg) {
         pthread_mutex_unlock(&app.mutex);
         if (ctx->sync_writes && (ctx->bytes_written / (256ULL * 1024ULL * 1024ULL)) !=
                                 ((ctx->bytes_written - (uint64_t)bytes_read) / (256ULL * 1024ULL * 1024ULL))) {
-            if (fdatasync(dst_fd) != 0) log_message("WARNING", "Periodic flush failed: %s", strerror(errno));
+            if (fdatasync(dst_fd) != 0) {
+                int saved_errno = errno;
+                pthread_mutex_lock(&app.mutex);
+                ctx->state = STATE_ERROR; ctx->error_code = saved_errno;
+                snprintf(ctx->message, sizeof(ctx->message), "Periodic flush failed: %s", strerror(saved_errno));
+                pthread_mutex_unlock(&app.mutex);
+                goto cleanup;
+            }
         }
         write_status_snapshot_throttled(ctx, 0);
     }
 
-    if (ctx->cancelled) {
+    if (ctx->cancelled || signal_received) {
         if (src_fd >= 0) close(src_fd);
         if (src_pid > 0) {
+            kill(src_pid, SIGTERM);
             int status = 0;
             while (waitpid(src_pid, &status, 0) < 0 && errno == EINTR) {}
         }
@@ -2768,7 +3110,13 @@ void *write_thread(void *arg) {
     }
     src_fd = -1;
     src_pid = -1;
-    
+    if (!compressed && ctx->bytes_written != ctx->bytes_total) {
+        pthread_mutex_lock(&app.mutex);
+        ctx->state = STATE_ERROR; ctx->error_code = EIO;
+        snprintf(ctx->message, sizeof(ctx->message), "Source image changed size while writing");
+        pthread_mutex_unlock(&app.mutex);
+        goto cleanup;
+    }
     pthread_mutex_lock(&app.mutex);
     ctx->state = STATE_SYNCING;
     snprintf(ctx->message, sizeof(ctx->message), "Syncing to disk...");
@@ -2785,8 +3133,9 @@ void *write_thread(void *arg) {
         goto cleanup;
     }
     
-#if defined(__linux__)
-    ioctl(dst_fd, BLKFLSBUF, 0);
+#if defined(__APPLE__) && defined(F_FULLFSYNC)
+    if (fcntl(dst_fd, F_FULLFSYNC) != 0)
+        log_message("WARNING", "Full hardware flush not available: %s", strerror(errno));
 #endif
     
     if (ctx->verify && !ctx->cancelled) {
@@ -2798,7 +3147,15 @@ void *write_thread(void *arg) {
         
         log_message("INFO", "Verifying written data");
         
-        close(dst_fd);
+        if (close(dst_fd) != 0) {
+            pthread_mutex_lock(&app.mutex);
+            ctx->state = STATE_ERROR; ctx->error_code = EIO;
+            snprintf(ctx->message, sizeof(ctx->message), "Failed to close written device before verification");
+            pthread_mutex_unlock(&app.mutex);
+            dst_fd = -1;
+            goto cleanup;
+        }
+        dst_fd = -1;
 
         src_fd = open_image_reader(image_path, image_type, &src_pid, &src_mode);
         if (src_fd < 0) {
@@ -2811,7 +3168,7 @@ void *write_thread(void *arg) {
             goto cleanup;
         }
         
-        dst_fd = open(device_path, O_RDONLY);
+        dst_fd = open(device_path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
         if (dst_fd < 0) {
             pthread_mutex_lock(&app.mutex);
             ctx->state = STATE_ERROR;
@@ -2822,7 +3179,9 @@ void *write_thread(void *arg) {
             goto cleanup;
         }
         
-        unsigned char *verify_buffer = malloc(ctx->block_size);
+        unsigned char *verify_buffer = NULL;
+        if (posix_memalign((void **)&verify_buffer, (size_t)sector, ctx->block_size) != 0)
+            verify_buffer = NULL;
         if (!verify_buffer) {
             pthread_mutex_lock(&app.mutex);
             ctx->state = STATE_ERROR;
@@ -2836,8 +3195,8 @@ void *write_thread(void *arg) {
         uint64_t verified = 0;
         int verify_failed = 0;
         
-        while (!ctx->cancelled && !verify_failed) {
-            ssize_t src_read = read(src_fd, buffer, ctx->block_size);
+        while (!ctx->cancelled && !signal_received && !verify_failed) {
+            ssize_t src_read = read_chunk_full(src_fd, buffer, ctx->block_size);
             if (src_read < 0) {
                 if (errno == EINTR) continue;
                 verify_failed = 1;
@@ -2845,13 +3204,19 @@ void *write_thread(void *arg) {
             }
             if (src_read == 0) break;
             
-            ssize_t dst_read = read(dst_fd, verify_buffer, (size_t)src_read);
-            if (dst_read != src_read) {
-                verify_failed = 1;
-                break;
+            size_t aligned = round_up_sector((size_t)src_read, (size_t)sector);
+            if (!aligned || aligned > ctx->block_size) { verify_failed = 1; break; }
+            if (aligned > (size_t)src_read) memset(buffer + src_read, 0, aligned - (size_t)src_read);
+            size_t got = 0;
+            while (got < aligned) {
+                ssize_t n = read(dst_fd, verify_buffer + got, aligned - got);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) break;
+                got += (size_t)n;
             }
+            if (got != aligned) { verify_failed = 1; break; }
             
-            if (memcmp(buffer, verify_buffer, (size_t)src_read) != 0) {
+            if (memcmp(buffer, verify_buffer, aligned) != 0) {
                 verify_failed = 1;
                 break;
             }
@@ -2874,9 +3239,10 @@ void *write_thread(void *arg) {
             write_status_snapshot_throttled(ctx, 0);
         }
 
-        if (ctx->cancelled) {
+        if (ctx->cancelled || signal_received) {
             if (src_fd >= 0) close(src_fd);
             if (src_pid > 0) {
+                kill(src_pid, SIGTERM);
                 int status = 0;
                 while (waitpid(src_pid, &status, 0) < 0 && errno == EINTR) {}
             }
@@ -2900,7 +3266,7 @@ void *write_thread(void *arg) {
         src_pid = -1;
         
         free(verify_buffer);
-        
+        if (verified != ctx->bytes_written) verify_failed = 1;
         if (verify_failed) {
             pthread_mutex_lock(&app.mutex);
             ctx->state = STATE_ERROR;
@@ -2915,13 +3281,6 @@ void *write_thread(void *arg) {
         log_message("INFO", "Verification successful");
     }
     
-    pthread_mutex_lock(&app.mutex);
-    ctx->state = STATE_COMPLETE;
-    ctx->progress = 100.0;
-    snprintf(ctx->message, sizeof(ctx->message), "Complete!");
-    pthread_mutex_unlock(&app.mutex);
-    write_status_snapshot(ctx);
-    
     if (ctx->make_bootable && ctx->mode != WRITE_MODE_WINDOWS) {
         pthread_mutex_lock(&app.mutex);
         ctx->state = STATE_PREPARING;
@@ -2932,9 +3291,18 @@ void *write_thread(void *arg) {
         setup_windows_boot(device_path, ctx->partition_scheme);
     }
 
+    pthread_mutex_lock(&app.mutex);
+    ctx->state = STATE_COMPLETE;
+    ctx->progress = 100.0;
+    snprintf(ctx->message, sizeof(ctx->message), "Complete!");
+    pthread_mutex_unlock(&app.mutex);
+    write_status_snapshot(ctx);
     log_message("INFO", "Write completed successfully");
     
 cleanup:
+    write_status_snapshot_throttled(ctx, 1);
+    if ((ctx->state == STATE_CANCELLED || signal_received) && src_pid > 0)
+        kill(src_pid, SIGTERM);
     if (buffer) free(buffer);
     if (src_fd >= 0) close_image_reader(src_fd, src_pid, src_mode);
     if (dst_fd >= 0) close(dst_fd);
@@ -2948,42 +3316,106 @@ cleanup:
 
 void signal_handler(int sig) {
     signal_received = sig;
-    app.ctx.cancelled = 1;
 }
 
 #ifndef CLI_MODE
 
-void update_device_list(void) {
+typedef struct {
+    uint64_t generation;
+    int count;
+    device_t devices[MAX_DEVICES];
+} device_probe_t;
+
+typedef struct {
+    uint64_t generation;
+    char path[MAX_PATH_LEN];
+} image_probe_t;
+
+static void update_write_enabled(void) {
+    int enabled = !app.running;
+    if (app.browse_button) gtk_widget_set_sensitive(app.browse_button, enabled);
+    if (app.refresh_button) gtk_widget_set_sensitive(app.refresh_button, enabled);
+    if (app.device_list) gtk_widget_set_sensitive(app.device_list, enabled);
+    if (app.write_button)
+        gtk_widget_set_sensitive(app.write_button,
+                                 enabled && !app.image_probing && !app.devices_probing &&
+                                 app.selected_device && app.image.path[0] &&
+                                 writable_image_type(app.image.type));
+}
+
+static void device_probe_worker(GTask *task, gpointer source_object,
+                                gpointer task_data, GCancellable *cancellable) {
+    (void)source_object; (void)cancellable;
+    device_probe_t *probe = task_data;
+    probe->count = enumerate_devices(probe->devices, MAX_DEVICES);
+    g_task_return_boolean(task, TRUE);
+}
+
+static void device_probe_finished(GObject *source, GAsyncResult *result,
+                                  gpointer user_data) {
+    (void)source; (void)user_data;
+    GTask *task = G_TASK(result);
+    device_probe_t *probe = g_task_get_task_data(task);
+    if (probe->generation != app.device_probe_generation) return;
+    app.devices_probing = 0;
+    if (app.running) { update_write_enabled(); return; }
+    app.selected_device = NULL;
     gtk_list_store_clear(app.device_store);
-    
-    app.device_count = enumerate_devices(app.devices, MAX_DEVICES);
-    
+    app.device_count = probe->count;
+    if (app.device_count < 0) app.device_count = 0;
+    if (app.device_count > MAX_DEVICES) app.device_count = MAX_DEVICES;
+    memcpy(app.devices, probe->devices, sizeof(device_t) * (size_t)app.device_count);
     for (int i = 0; i < app.device_count; i++) {
         device_t *dev = &app.devices[i];
-        char size_str[32];
-        char display[MAX_PATH_LEN + 512];
-        
+        char size_str[32], display[MAX_PATH_LEN + 512];
         format_size(dev->size, size_str, sizeof(size_str));
-        
-        if (strlen(dev->model) > 0) {
-            snprintf(display, sizeof(display), "%s - %s - %s%s%s",
-                     dev->path, size_str, dev->model,
-                     dev->removable ? " [Removable]" : "",
-                     dev->readonly ? " [Read-Only]" : "");
-        } else {
-            snprintf(display, sizeof(display), "%s - %s%s%s",
-                     dev->path, size_str,
-                     dev->removable ? " [Removable]" : "",
-                     dev->readonly ? " [Read-Only]" : "");
-        }
-        
+        snprintf(display, sizeof(display), "%s - %s - %s%s%s", dev->path, size_str,
+                 dev->model[0] ? dev->model : "Disk",
+                 dev->removable ? " [Removable]" : "",
+                 dev->readonly ? " [Read-Only]" : "");
         GtkTreeIter iter;
         gtk_list_store_append(app.device_store, &iter);
-        gtk_list_store_set(app.device_store, &iter,
-                           0, display,
-                           1, i,
-                           -1);
+        gtk_list_store_set(app.device_store, &iter, 0, display, 1, i, -1);
     }
+    gtk_label_set_text(GTK_LABEL(app.status_label), "Select a target device");
+    update_write_enabled();
+}
+
+void update_device_list(void) {
+    if (app.running) return;
+    device_probe_t *probe = g_try_new0(device_probe_t, 1);
+    if (!probe) return;
+    probe->generation = ++app.device_probe_generation;
+    app.devices_probing = 1;
+    gtk_label_set_text(GTK_LABEL(app.status_label), "Scanning devices in background...");
+    update_write_enabled();
+    GTask *task = g_task_new(NULL, NULL, device_probe_finished, NULL);
+    g_task_set_task_data(task, probe, g_free);
+    g_task_run_in_thread(task, device_probe_worker);
+    g_object_unref(task);
+}
+
+static void image_probe_worker(GTask *task, gpointer source_object,
+                               gpointer task_data, GCancellable *cancellable) {
+    (void)source_object; (void)cancellable;
+    image_probe_t *probe = task_data;
+    int result = is_windows_image(probe->path);
+    g_task_return_int(task, result);
+}
+
+static void image_probe_finished(GObject *source, GAsyncResult *result,
+                                 gpointer user_data) {
+    (void)source; (void)user_data;
+    GTask *task = G_TASK(result);
+    image_probe_t *probe = g_task_get_task_data(task);
+    int confidence = g_task_propagate_int(task, NULL);
+    if (probe->generation != app.image_probe_generation) return;
+    app.image_probing = 0;
+    app.image.is_windows = confidence;
+    gtk_label_set_text(GTK_LABEL(app.status_label),
+                       confidence >= 2 ? "Windows installer ISO detected" :
+                       "Image inspection complete");
+    update_write_enabled();
 }
 
 void on_browse_clicked(GtkButton *button, gpointer user_data) {
@@ -3028,21 +3460,42 @@ void on_browse_clicked(GtkButton *button, gpointer user_data) {
     if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
         char *filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
         
-        strncpy(app.image.path, filename, sizeof(app.image.path) - 1);
+        struct stat st;
+        if (!filename || strlen(filename) >= sizeof(app.image.path) ||
+            lstat(filename, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+            gtk_label_set_text(GTK_LABEL(app.status_label), "Invalid image: choose a nonempty regular file");
+            g_free(filename);
+            gtk_widget_destroy(dialog);
+            return;
+        }
+        snprintf(app.image.path, sizeof(app.image.path), "%s", filename);
         
         char *basename_ptr = strrchr(filename, '/');
         strncpy(app.image.name, basename_ptr ? basename_ptr + 1 : filename, 
                 sizeof(app.image.name) - 1);
         
-        struct stat st;
-        if (stat(filename, &st) == 0) {
-            app.image.size = (uint64_t)st.st_size;
-        }
+        app.image.size = (uint64_t)st.st_size;
         
         app.image.type = detect_image_type(filename);
         app.image.compressed = is_compressed_image(app.image.type);
-        /* Do the potentially expensive ISO classification now, never after confirmation. */
-        app.image.is_windows = (app.image.type == IMG_ISO) ? is_windows_image(filename) : 0;
+        app.image.is_windows = 0;
+        app.image_probe_generation++;
+        app.image_probing = 0;
+        if (!writable_image_type(app.image.type)) {
+            gtk_label_set_text(GTK_LABEL(app.status_label), "Unsupported image container: convert to raw first");
+        } else if (app.image.type == IMG_ISO) {
+            image_probe_t *probe = g_try_new0(image_probe_t, 1);
+            if (probe) {
+                probe->generation = app.image_probe_generation;
+                snprintf(probe->path, sizeof(probe->path), "%s", filename);
+                app.image_probing = 1;
+                GTask *task = g_task_new(NULL, NULL, image_probe_finished, NULL);
+                g_task_set_task_data(task, probe, g_free);
+                g_task_run_in_thread(task, image_probe_worker);
+                g_object_unref(task);
+                gtk_label_set_text(GTK_LABEL(app.status_label), "Inspecting ISO in background...");
+            }
+        }
         
         char display[MAX_PATH_LEN + 128];
         char size_str[32];
@@ -3051,6 +3504,7 @@ void on_browse_clicked(GtkButton *button, gpointer user_data) {
                  app.image.name, size_str, get_image_type_name(app.image.type));
         
         gtk_entry_set_text(GTK_ENTRY(app.image_entry), display);
+        update_write_enabled();
         
         g_free(filename);
         
@@ -3081,69 +3535,60 @@ void on_device_selected(GtkTreeSelection *selection, gpointer user_data) {
         if (index >= 0 && index < app.device_count) {
             app.selected_device = &app.devices[index];
             log_message("INFO", "Selected device: %s", app.selected_device->path);
+            update_write_enabled();
         }
     }
 }
 
 gboolean update_progress(gpointer user_data) {
     (void)user_data;
-    
+    double progress, speed;
+    time_t eta;
+    int running;
+    write_state_t state;
+    char message[512];
     pthread_mutex_lock(&app.mutex);
-    
-    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(app.progress_bar), 
-                                   app.ctx.progress / 100.0);
-    
-    char progress_text[64];
-    snprintf(progress_text, sizeof(progress_text), "%.1f%%", app.ctx.progress);
-    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(app.progress_bar), progress_text);
-    
-    gtk_label_set_text(GTK_LABEL(app.status_label), app.ctx.message);
-    
-    if (app.ctx.speed > 0) {
-        char speed_str[64];
-        format_speed(app.ctx.speed, speed_str, sizeof(speed_str));
-        gtk_label_set_text(GTK_LABEL(app.speed_label), speed_str);
-    }
-    
-    if (app.ctx.eta > 0) {
-        char eta_str[64];
-        format_time(app.ctx.eta, eta_str, sizeof(eta_str));
-        gtk_label_set_text(GTK_LABEL(app.eta_label), eta_str);
-    }
-    
-    int running = app.running;
-    write_state_t state = app.ctx.state;
-    
+    progress = app.ctx.progress;
+    speed = app.ctx.speed;
+    eta = app.ctx.eta;
+    state = app.ctx.state;
+    snprintf(message, sizeof(message), "%s", app.ctx.message);
+    running = app.running;
     pthread_mutex_unlock(&app.mutex);
-    
+    if (progress < 0.0) progress = 0.0;
+    if (progress > 100.0) progress = 100.0;
+    char percent[64];
+    if (app.image.compressed && (state == STATE_WRITING || state == STATE_VERIFYING)) {
+        gtk_progress_bar_pulse(GTK_PROGRESS_BAR(app.progress_bar));
+        snprintf(percent, sizeof(percent), "Streaming");
+    } else {
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(app.progress_bar), progress / 100.0);
+        snprintf(percent, sizeof(percent), "%.1f%%", progress);
+    }
+    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(app.progress_bar), percent);
+    gtk_label_set_text(GTK_LABEL(app.status_label), message);
+    char speed_str[64];
+    format_speed(speed, speed_str, sizeof(speed_str));
+    gtk_label_set_text(GTK_LABEL(app.speed_label), speed > 0.0 ? speed_str : "--");
+    char eta_str[64];
+    format_time(eta, eta_str, sizeof(eta_str));
+    gtk_label_set_text(GTK_LABEL(app.eta_label), eta > 0 ? eta_str : "--");
+
     if (!running) {
-        gtk_widget_set_sensitive(app.write_button, TRUE);
+        update_write_enabled();
         gtk_widget_set_sensitive(app.cancel_button, FALSE);
-        
-        if (state == STATE_COMPLETE) {
+        if (state == STATE_COMPLETE || state == STATE_ERROR) {
             GtkWidget *dialog = gtk_message_dialog_new(
-                GTK_WINDOW(app.window),
-                GTK_DIALOG_MODAL,
-                GTK_MESSAGE_INFO,
-                GTK_BUTTONS_OK,
-                "Image written successfully!");
-            gtk_dialog_run(GTK_DIALOG(dialog));
-            gtk_widget_destroy(dialog);
-        } else if (state == STATE_ERROR) {
-            GtkWidget *dialog = gtk_message_dialog_new(
-                GTK_WINDOW(app.window),
-                GTK_DIALOG_MODAL,
-                GTK_MESSAGE_ERROR,
-                GTK_BUTTONS_OK,
-                "Error: %s", app.ctx.message);
+                GTK_WINDOW(app.window), GTK_DIALOG_MODAL,
+                state == STATE_COMPLETE ? GTK_MESSAGE_INFO : GTK_MESSAGE_ERROR,
+                GTK_BUTTONS_OK, "%s", state == STATE_COMPLETE ?
+                "Image written successfully!" : message);
             gtk_dialog_run(GTK_DIALOG(dialog));
             gtk_widget_destroy(dialog);
         }
-        
         app.timer_id = 0;
         return G_SOURCE_REMOVE;
     }
-    
     return G_SOURCE_CONTINUE;
 }
 
@@ -3180,30 +3625,7 @@ static int sudo_askpass(int argc, char **argv) {
 }
 
 static int find_program_path(const char *program, char *out, size_t out_len) {
-    const char *path_env = getenv("PATH");
-    if (path_env && *path_env) {
-        char *copy = strdup(path_env);
-        if (copy) {
-            char *save = NULL;
-            for (char *dir = strtok_r(copy, ":", &save); dir; dir = strtok_r(NULL, ":", &save)) {
-                snprintf(out, out_len, "%s/%s", dir, program);
-                if (access(out, X_OK) == 0) {
-                    free(copy);
-                    return 0;
-                }
-            }
-            free(copy);
-        }
-    }
-
-    const char *dirs[] = {"/usr/bin", "/bin", "/usr/local/bin", "/usr/host/bin", "/opt/bin", NULL};
-    for (int i = 0; dirs[i]; i++) {
-        snprintf(out, out_len, "%s/%s", dirs[i], program);
-        if (access(out, X_OK) == 0) return 0;
-    }
-
-    out[0] = '\0';
-    return -1;
+    return trusted_command(program, out, out_len);
 }
 
 static gboolean privileged_status_poll(gpointer user_data) {
@@ -3217,6 +3639,13 @@ static gboolean privileged_status_poll(gpointer user_data) {
         return G_SOURCE_CONTINUE;
     }
 
+    struct flock lock = {0};
+    lock.l_type = F_RDLCK;
+    lock.l_whence = SEEK_SET;
+    if (fcntl(fileno(f), F_SETLK, &lock) != 0) {
+        fclose(f);
+        return G_SOURCE_CONTINUE;
+    }
     double progress = 0.0;
     unsigned long long bytes_written = 0;
     unsigned long long bytes_total = 0;
@@ -3230,6 +3659,8 @@ static gboolean privileged_status_poll(gpointer user_data) {
     if (ok && fgets(message, sizeof(message), f)) {
         message[strcspn(message, "\r\n")] = '\0';
     }
+    lock.l_type = F_UNLCK;
+    (void)fcntl(fileno(f), F_SETLK, &lock);
     fclose(f);
 
     if (!ok) return G_SOURCE_CONTINUE;
@@ -3266,9 +3697,11 @@ static gboolean privileged_status_poll(gpointer user_data) {
 
 static const char *gui_privilege_tool(void) {
 #if defined(__linux__)
-    if (program_exists_portable("pkexec")) return "pkexec";
+    char path[PATH_MAX];
+    if (trusted_command("pkexec", path, sizeof(path)) == 0) return "pkexec";
 #endif
-    if (program_exists_portable("sudo")) return "sudo";
+    char path2[PATH_MAX];
+    if (trusted_command("sudo", path2, sizeof(path2)) == 0) return "sudo";
     return NULL;
 }
 
@@ -3288,6 +3721,15 @@ static int run_privileged_cli_write(privileged_write_job_t *job) {
     int result = -1;
     gchar *helper_dir = NULL, *helper_path = NULL;
     gchar **env = g_get_environ();
+    const char *unsafe_env[] = {
+        "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH", "BASH_ENV", "ENV", "PYTHONPATH", "PYTHONHOME", NULL
+    };
+    for (int i = 0; unsafe_env[i]; i++) {
+        gchar **cleaned = g_environ_unsetenv(env, unsafe_env[i]);
+        g_strfreev(env);
+        env = cleaned;
+    }
     int use_sudo = strcmp(tool, "sudo") == 0;
     if (use_sudo) {
         /* A private helper handles arbitrary sudo/PAM prompts, with no password
@@ -3333,6 +3775,7 @@ static int run_privileged_cli_write(privileged_write_job_t *job) {
     argv[n++] = "--partition"; argv[n++] = (char *)part;
     argv[n++] = "--status-file"; argv[n++] = job->status_file;
     if (job->sync_writes) argv[n++] = "--extra-flush";
+    if (job->windows) argv[n++] = "--windows";
     if (job->verify) argv[n++] = "-V";
     argv[n++] = "-y";
     argv[n] = NULL;
@@ -3391,7 +3834,8 @@ static gboolean privileged_write_finished(gpointer user_data) {
         job->poll_id = 0;
     }
 
-    gtk_widget_set_sensitive(app.write_button, TRUE);
+    app.running = 0;
+    update_write_enabled();
     gtk_widget_set_sensitive(app.cancel_button, FALSE);
     gtk_label_set_text(GTK_LABEL(app.status_label), job->result == 0 ? "Privileged write complete" : "Privileged write failed");
     gtk_progress_bar_set_text(GTK_PROGRESS_BAR(app.progress_bar), job->result == 0 ? "Complete" : "Failed");
@@ -3447,6 +3891,8 @@ void on_write_clicked(GtkButton *button, gpointer user_data) {
         return;
     }
     
+    if (app.running || app.image_probing || app.devices_probing) return;
+    if (!writable_image_type(app.image.type)) return;
     if (!valid_target_device_path(app.selected_device->path)) {
         GtkWidget *dialog = gtk_message_dialog_new(
             GTK_WINDOW(app.window), GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
@@ -3506,6 +3952,7 @@ void on_write_clicked(GtkButton *button, gpointer user_data) {
     }
     
     memset(&app.ctx, 0, sizeof(write_context_t));
+    atomic_init(&app.ctx.cancelled, 0);
     app.ctx.bytes_total = app.image.compressed ? 0 : app.image.size;
     app.ctx.verify = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app.verify_check));
     app.ctx.sync_writes = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app.sync_check));
@@ -3514,9 +3961,12 @@ void on_write_clicked(GtkButton *button, gpointer user_data) {
     app.ctx.partition_scheme = (partition_scheme_t)part_idx;
     app.ctx.make_bootable = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(app.bootable_check));
     
-    if (app.image.is_windows && !app.ctx.make_bootable) {
-        app.ctx.make_bootable = 1;
+    if (app.ctx.make_bootable && app.image.type != IMG_ISO && !app.image.is_windows) {
+        gtk_label_set_text(GTK_LABEL(app.status_label), "Windows mode requires a Windows ISO");
+        return;
     }
+    if (app.ctx.make_bootable && app.image.type == IMG_ISO) app.image.is_windows = 3;
+    if (app.image.is_windows) app.ctx.make_bootable = 1;
     
     gchar *block_size_str = gtk_combo_box_text_get_active_text(
         GTK_COMBO_BOX_TEXT(app.blocksize_combo));
@@ -3556,6 +4006,7 @@ void on_write_clicked(GtkButton *button, gpointer user_data) {
         snprintf(job->device_path, sizeof(job->device_path), "%s", app.selected_device->path);
         job->verify = app.ctx.verify;
         job->sync_writes = app.ctx.sync_writes;
+        job->windows = (app.ctx.make_bootable && app.image.type == IMG_ISO);
         job->partition_scheme = app.ctx.partition_scheme;
         job->block_size = app.ctx.block_size;
 
@@ -3574,7 +4025,8 @@ void on_write_clicked(GtkButton *button, gpointer user_data) {
         snprintf(job->status_file, sizeof(job->status_file), "%s", status_template);
         job->start_time = time(NULL);
 
-        gtk_widget_set_sensitive(app.write_button, FALSE);
+        app.running = 1;
+        update_write_enabled();
         gtk_widget_set_sensitive(app.cancel_button, FALSE);
         gtk_label_set_text(GTK_LABEL(app.status_label), "Waiting for administrator authentication...");
         gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(app.progress_bar), 0.0);
@@ -3587,6 +4039,8 @@ void on_write_clicked(GtkButton *button, gpointer user_data) {
             if (job->poll_id) g_source_remove(job->poll_id);
             unlink(job->status_file);
             free(job);
+            app.running = 0;
+            update_write_enabled();
             GtkWidget *err_dialog = gtk_message_dialog_new(
                 GTK_WINDOW(app.window), GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR,
                 GTK_BUTTONS_OK, "Failed to start privileged writer.");
@@ -3598,14 +4052,18 @@ void on_write_clicked(GtkButton *button, gpointer user_data) {
         return;
     }
     
-    gtk_widget_set_sensitive(app.write_button, FALSE);
-    gtk_widget_set_sensitive(app.cancel_button, TRUE);
-    
     app.running = 1;
-    
-    pthread_create(&app.write_thread, NULL, write_thread, NULL);
-    
-    app.timer_id = g_timeout_add(100, update_progress, NULL);
+    update_write_enabled();
+    gtk_widget_set_sensitive(app.cancel_button, TRUE);
+    if (pthread_create(&app.write_thread, NULL, write_thread, NULL) != 0) {
+        app.running = 0;
+        update_write_enabled();
+        gtk_widget_set_sensitive(app.cancel_button, FALSE);
+        gtk_label_set_text(GTK_LABEL(app.status_label), "Cannot start writer thread");
+        return;
+    }
+    pthread_detach(app.write_thread);
+    app.timer_id = g_timeout_add(150, update_progress, NULL);
 }
 
 void on_cancel_clicked(GtkButton *button, gpointer user_data) {
@@ -3626,6 +4084,23 @@ void on_cancel_clicked(GtkButton *button, gpointer user_data) {
     gtk_widget_destroy(dialog);
 }
 
+static gboolean on_window_delete(GtkWidget *widget, GdkEvent *event, gpointer data) {
+    (void)widget; (void)event; (void)data;
+    if (app.running) {
+        gtk_label_set_text(GTK_LABEL(app.status_label),
+                           "Finish or cancel the write before closing UnixImage");
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void on_exit_clicked(GtkButton *button, gpointer data) {
+    (void)button; (void)data;
+    if (!app.running) gtk_main_quit();
+    else gtk_label_set_text(GTK_LABEL(app.status_label),
+                            "A write is active; please cancel it first");
+}
+
 void create_gui(void) {
     app.window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(app.window), "UnixImage - Universal Disk Image Writer");
@@ -3633,6 +4108,7 @@ void create_gui(void) {
     gtk_window_set_position(GTK_WINDOW(app.window), GTK_WIN_POS_CENTER);
     gtk_container_set_border_width(GTK_CONTAINER(app.window), 15);
     
+    g_signal_connect(app.window, "delete-event", G_CALLBACK(on_window_delete), NULL);
     g_signal_connect(app.window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
     
     GtkWidget *main_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
@@ -3663,6 +4139,7 @@ void create_gui(void) {
     gtk_box_pack_start(GTK_BOX(image_box), app.image_entry, TRUE, TRUE, 0);
     
     GtkWidget *browse_button = gtk_button_new_with_label("Browse...");
+    app.browse_button = browse_button;
     g_signal_connect(browse_button, "clicked", G_CALLBACK(on_browse_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(image_box), browse_button, FALSE, FALSE, 0);
     
@@ -3693,6 +4170,7 @@ void create_gui(void) {
     gtk_container_add(GTK_CONTAINER(scrolled), app.device_list);
     
     GtkWidget *refresh_button = gtk_button_new_with_label("Refresh Devices");
+    app.refresh_button = refresh_button;
     g_signal_connect(refresh_button, "clicked", G_CALLBACK(on_refresh_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(device_box), refresh_button, FALSE, FALSE, 0);
     
@@ -3783,11 +4261,11 @@ void create_gui(void) {
     
     GtkWidget *exit_button = gtk_button_new_with_label("Exit");
     gtk_widget_set_size_request(exit_button, 150, 40);
-    g_signal_connect(exit_button, "clicked", G_CALLBACK(gtk_main_quit), NULL);
+    g_signal_connect(exit_button, "clicked", G_CALLBACK(on_exit_clicked), NULL);
     gtk_box_pack_start(GTK_BOX(button_box), exit_button, TRUE, TRUE, 0);
     
+    gtk_widget_set_sensitive(app.write_button, FALSE);
     update_device_list();
-    
     gtk_widget_show_all(app.window);
 }
 
@@ -3805,12 +4283,13 @@ static int reexec_with_privilege(int argc, char *argv[]) {
     }
 
     for (int t = 0; tools[t]; t++) {
-        if (!program_exists_portable(tools[t])) continue;
+        char safe_tool[PATH_MAX];
+        if (trusted_command(tools[t], safe_tool, sizeof(safe_tool)) != 0) continue;
         char **new_argv = calloc((size_t)argc + 3, sizeof(char *));
         if (!new_argv) return -1;
 
         int n = 0;
-        new_argv[n++] = (char *)tools[t];
+        new_argv[n++] = safe_tool;
         for (int i = 0; i < argc; i++) {
             new_argv[n++] = i == 0 ? app_exe_path : argv[i];
         }
@@ -3818,7 +4297,11 @@ static int reexec_with_privilege(int argc, char *argv[]) {
         new_argv[n] = NULL;
 
         fprintf(stderr, "Administrator privileges are required to write disk images. Trying %s...\n", tools[t]);
-        execvp(tools[t], new_argv);
+        char *const trusted_env[] = {
+            "PATH=/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin:/usr/local/bin",
+            "LANG=C", "LC_ALL=C", "HOME=/", "TERM=xterm", NULL
+        };
+        execve(safe_tool, new_argv, trusted_env);
         free(new_argv);
     }
 
@@ -3835,24 +4318,25 @@ void print_usage(const char *prog) {
     printf("  -l, --list        List available devices\n");
     printf("  -i, --image FILE  Specify image file\n");
     printf("  -d, --device DEV  Specify target device\n");
+    printf("      --windows     Force Windows installer USB mode for ISO files\n");
+    printf("      --raw         Force raw write (disable auto Windows detection)\n");
     printf("  -y, --yes         Skip confirmation prompt\n");
     printf("  -V, --verify      Verify after writing\n");
     printf("  -b, --blocksize N Set block size in bytes\n");
     printf("  --partition P     Windows USB partition scheme: auto, mbr, gpt\n");
     printf("  --extra-flush     Periodically flush while writing (slower)\n");
-    printf("  -q, --quiet       Quiet mode\n");
     printf("  --status-file F   Write machine-readable progress to file\n");
 #ifndef CLI_MODE
     printf("  -c, --cli         Force CLI mode\n");
 #endif
     printf("\nSupported image formats:\n");
-    printf("  ISO, IMG, RAW, DMG, VHD, VHDX, VDI, VMDK, QCOW, QCOW2\n");
-    printf("  Compressed: XZ, GZ, BZ2, ZSTD, LZ4, ZIP\n");
-    printf("  Windows installer ISOs: FAT32 USB with automatic install.wim splitting\n");
-    printf("\nSupported operating systems:\n");
-    printf("  Linux, macOS, FreeBSD, OpenBSD, NetBSD, DragonFly BSD,\n");
-    printf("  Solaris, illumos, AIX, HP-UX, IRIX, QNX, MINIX, Haiku,\n");
-    printf("  GNU/Hurd, MidnightBSD, HardenedBSD, GhostBSD, and more\n");
+    printf("  Raw byte streams: ISO, IMG, RAW\n");
+    printf("  Single-file compressed byte streams: XZ, GZ, BZ2, ZSTD, LZ4\n");
+    printf("  Windows installer ISOs: Linux file-copy mode (requires tools)\n");
+    printf("  DMG, VHD, VDI, VMDK, QCOW, ZIP and WIM require conversion first.\n");
+    printf("\nDisk-write backends (platform validation required):\n");
+    printf("  Linux, macOS, FreeBSD, OpenBSD, NetBSD, DragonFly BSD.\n");
+    printf("  Unsupported/unknown OS disk writes are refused for safety.\n");
 }
 
 void print_version(void) {
@@ -3889,7 +4373,7 @@ int cli_write(const char *image_path, const char *device_path,
               int verify, int skip_confirm, size_t block_size,
               partition_scheme_t partition_scheme, int extra_flush) {
     struct stat st;
-    if (stat(image_path, &st) != 0) {
+    if (lstat(image_path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
         fprintf(stderr, "Error: Cannot access image file: %s\n", image_path);
         return 1;
     }
@@ -3899,11 +4383,23 @@ int cli_write(const char *image_path, const char *device_path,
         return 1;
     }
 
-    strncpy(app.image.path, image_path, sizeof(app.image.path) - 1);
+    if (strlen(image_path) >= sizeof(app.image.path)) {
+        fprintf(stderr, "Error: Image path too long.\n"); return 1;
+    }
+    snprintf(app.image.path, sizeof(app.image.path), "%s", image_path);
     app.image.size = (uint64_t)st.st_size;
     app.image.type = detect_image_type(image_path);
+    if (!writable_image_type(app.image.type)) {
+        fprintf(stderr, "Error: %s is not supported as a direct disk image; convert it to raw/ISO first.\n",
+                get_image_type_name(app.image.type));
+        return 1;
+    }
     app.image.compressed = is_compressed_image(app.image.type);
-    app.image.is_windows = (app.image.type == IMG_ISO) ? is_windows_image(image_path) : 0;
+    if (cli_force_windows && app.image.type != IMG_ISO) {
+        fprintf(stderr, "Error: --windows requires an ISO image.\n"); return 1;
+    }
+    app.image.is_windows = cli_force_raw ? 0 : cli_force_windows ? 3 :
+                           app.image.type == IMG_ISO ? is_windows_image(image_path) : 0;
     
     int found = 0;
     app.device_count = enumerate_devices(app.devices, MAX_DEVICES);
@@ -3916,21 +4412,18 @@ int cli_write(const char *image_path, const char *device_path,
     }
     
     if (!found) {
-        if (app.device_count >= MAX_DEVICES) {
-            fprintf(stderr, "Error: Device list is full; cannot add manual target: %s\n", device_path);
-            return 1;
-        }
-        device_t *manual_dev = &app.devices[app.device_count];
-        memset(manual_dev, 0, sizeof(device_t));
-        strncpy(manual_dev->path, device_path, sizeof(manual_dev->path) - 1);
-        manual_dev->size = get_device_size(device_path);
-        if (manual_dev->size == 0) {
-            fprintf(stderr, "Error: Cannot access device: %s\n", device_path);
-            return 1;
-        }
-        app.selected_device = manual_dev;
+        fprintf(stderr, "Error: %s is not an enumerated whole disk. Refusing raw or unknown devices.\n", device_path);
+        return 1;
     }
-    
+    if (app.selected_device->readonly || app.selected_device->size == 0) {
+        fprintf(stderr, "Error: Target is read-only or size is unknown.\n");
+        return 1;
+    }
+    if (!app.image.compressed && !app.image.is_windows &&
+        app.image.size > app.selected_device->size) {
+        fprintf(stderr, "Error: Image is larger than target device.\n"); return 1;
+    }
+
 #if defined(__linux__)
     if (target_has_critical_mount_linux(device_path)) {
         fprintf(stderr, "Error: Refusing to overwrite a disk containing /, /home, /boot, or /boot/efi.\n");
@@ -3973,6 +4466,7 @@ int cli_write(const char *image_path, const char *device_path,
     }
     
     memset(&app.ctx, 0, sizeof(write_context_t));
+    atomic_init(&app.ctx.cancelled, 0);
     app.ctx.bytes_total = app.image.compressed ? 0 : app.image.size;
     app.ctx.verify = verify;
     app.ctx.block_size = block_size;
@@ -4041,6 +4535,7 @@ int main(int argc, char *argv[]) {
 #endif
 
     memset(&app, 0, sizeof(app_t));
+    atomic_init(&app.running, 0);
     if (argc > 0) remember_executable_path(argv[0]);
     pthread_mutex_init(&app.mutex, NULL);
 
@@ -4049,7 +4544,8 @@ int main(int argc, char *argv[]) {
     strncpy(app.os_name, get_os_name(app.os), sizeof(app.os_name) - 1);
     app.is_root = (geteuid() == 0);
 
-    app.log_file = fopen(LOG_FILE, "a");
+    /* stderr is the default diagnostic channel; no privileged /tmp log files. */
+    app.log_file = NULL;
 
     log_message("INFO", "UnixImage v%s starting on %s", VERSION, app.os_name);
 
@@ -4066,6 +4562,7 @@ int main(int argc, char *argv[]) {
     char *image_file = NULL;
     char *device_file = NULL;
     char *status_file = NULL;
+    int force_windows = 0, force_raw = 0;
     
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -4082,6 +4579,10 @@ int main(int argc, char *argv[]) {
             skip_confirm = 1;
         } else if (strcmp(argv[i], "--sudo-mode") == 0) {
             app.sudo_mode = 1;
+        } else if (strcmp(argv[i], "--windows") == 0) {
+            force_windows = 1;
+        } else if (strcmp(argv[i], "--raw") == 0) {
+            force_raw = 1;
         } else if (strcmp(argv[i], "--extra-flush") == 0) {
             extra_flush = 1;
         } else if (strcmp(argv[i], "--partition") == 0 && i + 1 < argc) {
@@ -4096,11 +4597,15 @@ int main(int argc, char *argv[]) {
             verify = 1;
         } else if ((strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--blocksize") == 0) 
                    && i + 1 < argc) {
-            block_size = (size_t)atol(argv[++i]);
-            if (block_size < MIN_BLOCK_SIZE || block_size > MAX_BLOCK_SIZE) {
-                fprintf(stderr, "Invalid block size. Using default.\n");
-                block_size = DEFAULT_BLOCK_SIZE;
+            const char *arg = argv[++i];
+            char *end = NULL;
+            errno = 0;
+            unsigned long long requested = strtoull(arg, &end, 10);
+            if (errno || !end || *end || requested < MIN_BLOCK_SIZE || requested > MAX_BLOCK_SIZE) {
+                fprintf(stderr, "Invalid block size. Must be 512 through %u bytes.\n", (unsigned)MAX_BLOCK_SIZE);
+                return 2;
             }
+            block_size = (size_t)requested;
         } else if ((strcmp(argv[i], "-i") == 0 || strcmp(argv[i], "--image") == 0) 
                    && i + 1 < argc) {
             image_file = argv[++i];
@@ -4108,11 +4613,12 @@ int main(int argc, char *argv[]) {
                    && i + 1 < argc) {
             device_file = argv[++i];
         } else if (argv[i][0] != '-') {
-            if (!image_file) {
-                image_file = argv[i];
-            } else if (!device_file) {
-                device_file = argv[i];
-            }
+            if (!image_file) image_file = argv[i];
+            else if (!device_file) device_file = argv[i];
+            else { fprintf(stderr, "Too many positional arguments.\n"); return 2; }
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            return 2;
         }
     }
     
@@ -4128,13 +4634,21 @@ int main(int argc, char *argv[]) {
     
     if (image_file && device_file) {
         cli_mode = 1;
-}
+    }
 
-    if (status_file) {
+    if (status_file && app.is_root) {
+        if (strlen(status_file) >= sizeof(status_file_path) ||
+            (status_fd = open_status_channel(status_file)) < 0) {
+            fprintf(stderr, "Unsafe status file refused: %s\n", strerror(errno));
+            return 1;
+        }
         snprintf(status_file_path, sizeof(status_file_path), "%s", status_file);
     }
 
     if (cli_mode) {
+        if (force_raw && force_windows) {
+            fprintf(stderr, "Cannot specify both --raw and --windows.\n"); return 2;
+        }
         if (!image_file || !device_file) {
             fprintf(stderr, "Error: Image and device must be specified in CLI mode.\n");
             fprintf(stderr, "Use -h for help.\n");
@@ -4152,8 +4666,11 @@ int main(int argc, char *argv[]) {
             return reexec_with_privilege(argc, argv) == 0 ? 0 : 1;
         }
         
+        cli_force_windows = force_windows;
+        cli_force_raw = force_raw;
         int ret = cli_write(image_file, device_file, verify, skip_confirm, block_size,
                             partition_scheme, extra_flush);
+        if (status_fd >= 0) { close(status_fd); status_fd = -1; }
         if (app.log_file) fclose(app.log_file);
         pthread_mutex_destroy(&app.mutex);
         return ret;
